@@ -206,13 +206,13 @@ fn loadScores(files: filesystem, path: string) -> Scores {
     }
 }
 
-fn printBest(terminal: console, scores: Scores) -> result<unit, HostError> {
+pure deterministic terminates fn scoreHeader(scores: Scores) -> string {
     match scores {
         Ready(history) {
-            return print(terminal, concat(left: "Best score: ", right: formatInt32(history.best)));
+            return concat(left: "Best score: ", right: formatInt32(history.best));
         }
         Unavailable(reason) {
-            return print(terminal, concat(left: "Score saving disabled: ", right: reason));
+            return concat(left: "Score saving disabled: ", right: reason);
         }
     }
 }
@@ -238,37 +238,88 @@ fn finishRound(terminal: console, files: filesystem, path: string, scores: Score
     return print(terminal, concat(left: summary, right: concat(left: "\n", right: status)));
 }
 
-fn readCommand(terminal: console) -> result<Command, HostError> {
+pure deterministic terminates fn commandForTick(keys: list<string>, direction: Direction) -> Command {
+    let mut selected = direction;
+    for key in keys {
+        match command(key) {
+            Quit { return Command::Quit; }
+            Invalid {}
+            Move(requested) {
+                // Compare every key against the direction at the start of this tick.
+                if isReverse(current: direction, requested: requested) == false {
+                    selected = requested;
+                }
+            }
+        }
+    }
+    return Command::Move(selected);
+}
+
+pure deterministic terminates fn commandInputError(error: HostError) -> result<Command, HostError> {
+    if hostErrorKind(error) == HostErrorKind::EndOfInput { return Ok(Command::Quit); }
+    return Err(error);
+}
+
+fn readCommand(terminal: console, direction: Direction, interactive: bool) -> result<Command, HostError> {
+    if interactive {
+        match readKeysFor(terminal, 150 as int32<ms>) {
+            Ok(keys) { return Ok(commandForTick(keys, direction)); }
+            Err(error) { return commandInputError(error); }
+        }
+    }
     match input(terminal) {
         Ok(text) { return Ok(command(text)); }
-        Err(error) {
-            if hostErrorKind(error) == HostErrorKind::EndOfInput { return Ok(Command::Quit); }
-            return Err(error);
-        }
+        Err(error) { return commandInputError(error); }
     }
 }
 
-fn play(terminal: console, files: filesystem, path: string) -> result<unit, HostError> {
-    let scores = loadScores(files, path);
-    match printBest(terminal, scores) {
-        Ok(printed) {}
-        Err(error) { return Err(error); }
+pure deterministic terminates fn screenText(game: Game, heading: string) -> string {
+    let header = concat(left: "\u001b[H", right: concat(left: heading, right: "\n"));
+    let board = concat(left: render(game), right: "\n\u001b[J");
+    return concat(left: header, right: board);
+}
+
+fn showBoard(terminal: console, game: Game, heading: string, interactive: bool) -> result<unit, HostError> {
+    if interactive { return write(terminal, screenText(game, heading)); }
+    return print(terminal, render(game));
+}
+
+pure deterministic terminates fn victoryText(game: Game, heading: string, interactive: bool) -> string {
+    if interactive {
+        return concat(left: screenText(game, heading), right: "You filled the board!");
     }
-    match print(terminal, "Snake | w/a/s/d + Enter to move | q to quit") {
-        Ok(printed) {}
-        Err(error) { return Err(error); }
+    return concat(left: render(game), right: "\nYou filled the board!");
+}
+
+fn playRound(terminal: console, files: filesystem, path: string, interactive: bool) -> result<unit, HostError> {
+    let scores = loadScores(files, path);
+    let mut instructions = "\nSnake | w/a/s/d + Enter to move | q to quit";
+    if interactive {
+        instructions = "\nSnake | w/a/s/d to steer | q to quit";
+    }
+    let heading = concat(left: scoreHeader(scores), right: instructions);
+    if interactive {
+        match write(terminal, "\u001b[2J") {
+            Ok(written) {}
+            Err(error) { return Err(error); }
+        }
+    } else {
+        match print(terminal, heading) {
+            Ok(printed) {}
+            Err(error) { return Err(error); }
+        }
     }
 
     let mut game = initialGame();
     let mut redraw = true;
     loop {
         if redraw {
-            match print(terminal, render(game)) {
+            match showBoard(terminal, game, heading, interactive) {
                 Ok(printed) { redraw = false; }
                 Err(error) { return Err(error); }
             }
         }
-        match readCommand(terminal) {
+        match readCommand(terminal, game.direction, interactive) {
             Ok(next) {
                 match next {
                     Quit { return print(terminal, "Round abandoned."); }
@@ -298,7 +349,7 @@ fn play(terminal: console, files: filesystem, path: string) -> result<unit, Host
                                                            message: "You hit the snake.", score: game.score);
                                     }
                                     Won(state) {
-                                        let victory = concat(left: render(state), right: "\nYou filled the board!");
+                                        let victory = victoryText(state, heading, interactive);
                                         return finishRound(terminal, files, path: path, scores,
                                                            message: victory, score: state.score);
                                     }
@@ -311,6 +362,13 @@ fn play(terminal: console, files: filesystem, path: string) -> result<unit, Host
             }
             Err(error) { return Err(error); }
         }
+    }
+}
+
+fn play(terminal: console, files: filesystem, path: string) -> result<unit, HostError> {
+    match enableKeyInput(terminal) {
+        Ok(interactive) { return playRound(terminal, files, path, interactive); }
+        Err(error) { return Err(error); }
     }
 }
 

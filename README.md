@@ -24,11 +24,14 @@ python3 -B -m prototype run examples/live-io.proto --console --filesystem
 | Host function | Result |
 | --- | --- |
 | `print(console, text)` | `result<unit, HostError>` |
+| `write(console, text)` | `result<unit, HostError>` |
 | `input(console)` | `result<string, HostError>` |
+| `enableKeyInput(console)` | `result<bool, HostError>` |
+| `readKeysFor(console, timeout: int32<ms>)` | `result<list<string>, HostError>` |
 | `readFileUTF8(filesystem, path)` | `result<string, HostError>` |
 | `writeFileUTF8(filesystem, path: path, text: text)` | `result<unit, HostError>` |
 
-The host functions run immediately when called. `input` reads one line and returns `Err(EndOfInput)` at end of input. Host functions carry no function guarantees.
+The host functions run immediately when called. `write` flushes text as supplied, and `print` also appends a newline. `input` reads one line and returns `Err(EndOfInput)` at end of input. `enableKeyInput` switches a supported Unix terminal to character input with echo disabled and returns `false` when that mode is unavailable. Once enabled, `readKeysFor` collects the decoded input characters in order for the given duration. A zero timeout polls immediately. The runner restores the terminal when the program exits. Host functions carry no function guarantees.
 
 ## Play Snake
 
@@ -36,7 +39,9 @@ The host functions run immediately when called. `input` reads one line and retur
 python3 -B -m prototype run examples/snake.proto --console --filesystem
 ```
 
-Use `w`, `a`, `s`, or `d` followed by Enter to move. The head is `@`, the body is `o`, and food is `*`. Type `q` to abandon the round. The game saves completed rounds in `snake-scores.txt` in the current working directory and reads the best score on startup. The score file assumes one running game writes it at a time. A malformed or unreadable history disables saving for that run.
+On a supported Unix terminal, Snake advances automatically about every 150 ms and redraws in place. Press `w`, `a`, `s`, or `d` to steer and `q` to quit. With redirected streams or an unsupported terminal, use those commands followed by Enter. The head is `@`, the body is `o`, and food is `*`.
+
+The game saves completed rounds in `snake-scores.txt` in the current working directory and reads the best score on startup. The score file assumes one running game writes it at a time. A malformed or unreadable history disables saving for that run.
 
 Run the game and language checks with `python3 -B -m unittest discover -s tests`.
 

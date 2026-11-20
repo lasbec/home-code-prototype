@@ -86,6 +86,18 @@ class SnakeRules(unittest.TestCase):
         self.assertEqual(finished["food"].tag, "Full")
         self.assertEqual(len(finished["body"]), 95)
 
+    def test_timed_key_batch_uses_latest_move_legal_at_start_of_tick(self):
+        cases = (
+            ((), Variant("Command", "Move", direction("Right"))),
+            (("w", "s"), Variant("Command", "Move", direction("Down"))),
+            (("w", "a", "?"), Variant("Command", "Move", direction("Up"))),
+            (("w", "q", "s"), Variant("Command", "Quit")),
+        )
+        for keys, expected in cases:
+            with self.subTest(keys=keys):
+                self.assertEqual(self.interpreter.call("commandForTick", (keys, direction("Right"))),
+                                 expected)
+
     def test_write_failure_reports_score_and_preserves_file(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory, "scores.txt")
@@ -128,6 +140,7 @@ class SnakePersistence(unittest.TestCase):
 
     def test_reversal_invalid_command_quit_and_eof(self):
         result = self.play("?\na\nq\n")
+        self.assertNotIn("\x1b", result)
         self.assertIn("Enter w, a, s, d, or q.", result)
         self.assertIn("The snake cannot reverse directly.", result)
         self.assertEqual(result.count("Score: 0"), 1)

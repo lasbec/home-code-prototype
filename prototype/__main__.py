@@ -1,12 +1,18 @@
 """Command-line entry point for the language prototype."""
 
 import argparse
+from contextlib import ExitStack
 from pathlib import Path
+import signal
 import sys
 
 from .checker import Checker
 from .runtime import Console, Filesystem, Interpreter, display
 from .syntax import LanguageError, Parser
+
+
+def terminate(signum, _frame):
+    raise SystemExit(128 + signum)
 
 
 def main():
@@ -48,9 +54,19 @@ def main():
             cli.error(f"main requires --{capability}")
         arguments.append(capabilities[capability])
     try:
-        value = Interpreter(program).call("main", arguments)
+        with ExitStack() as cleanup:
+            if "console" in capabilities:
+                previous = signal.signal(signal.SIGTERM, terminate)
+                cleanup.callback(signal.signal, signal.SIGTERM, previous)
+                cleanup.callback(capabilities["console"].restore_key_input)
+            value = Interpreter(program).call("main", arguments)
+    except KeyboardInterrupt:
+        return 130
     except RecursionError:
         print("prototype interpreter reached its call stack limit", file=sys.stderr)
+        return 1
+    except OSError as error:
+        print(error, file=sys.stderr)
         return 1
     if value is not None:
         print(display(value))

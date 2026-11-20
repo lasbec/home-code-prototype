@@ -20,7 +20,11 @@ def builtin(name, parameters, output, modifiers=frozenset()):
 HOST_FUNCTIONS = {
     function.name: function for function in (
         builtin("print", (("console", CONSOLE), ("text", STRING)), result_type(UNIT, HOST_ERROR)),
+        builtin("write", (("console", CONSOLE), ("text", STRING)), result_type(UNIT, HOST_ERROR)),
         builtin("input", (("console", CONSOLE),), result_type(STRING, HOST_ERROR)),
+        builtin("enableKeyInput", (("console", CONSOLE),), result_type(BOOL, HOST_ERROR)),
+        builtin("readKeysFor", (("console", CONSOLE), ("timeout", Type("int32", units=(("ms", 1),)))),
+                result_type(Type("list", (STRING,)), HOST_ERROR)),
         builtin("readFileUTF8", (("filesystem", FILESYSTEM), ("path", STRING)),
                 result_type(STRING, HOST_ERROR)),
         builtin("writeFileUTF8", (("filesystem", FILESYSTEM), ("path", STRING), ("text", STRING)),

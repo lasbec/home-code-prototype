@@ -1,8 +1,18 @@
 """Interpreter for checked programs and live built-in host environments."""
 
-from dataclasses import dataclass
+import codecs
+from dataclasses import dataclass, field
 from operator import eq, ge, gt, le, lt, ne, truediv
+import os
 from pathlib import Path
+from select import select
+from time import monotonic
+
+try:
+    import termios
+    import tty
+except ImportError:
+    termios = None
 
 
 @dataclass
@@ -35,10 +45,23 @@ class Failure:
     message: str = ""
 
 
-@dataclass(frozen=True)
+@dataclass
 class Console:
     stdin: object
     stdout: object
+    _terminal_state: tuple | None = field(default=None, init=False, repr=False)
+    _decoder: codecs.IncrementalDecoder | None = field(default=None, init=False, repr=False)
+
+    def restore_key_input(self):
+        if self._terminal_state is None:
+            return
+        fd, saved = self._terminal_state
+        try:
+            termios.tcsetattr(fd, termios.TCSAFLUSH, saved)
+        except termios.error as error:
+            raise OSError(f"could not restore terminal settings: {error}") from error
+        self._terminal_state = None
+        self._decoder = None
 
 
 @dataclass(frozen=True)
@@ -46,15 +69,26 @@ class Filesystem:
     pass
 
 
-def print_text(console, text):
+def output_text(console, text, error_code):
     try:
-        print(text, file=console.stdout, flush=True)
+        console.stdout.write(text)
+        console.stdout.flush()
         return Result("Ok", None)
     except (OSError, UnicodeError, ValueError) as error:
-        return Result("Err", Failure("PrintError", str(error)))
+        return Result("Err", Failure(error_code, str(error)))
+
+
+def print_text(console, text):
+    return output_text(console, text + "\n", "PrintError")
+
+
+def write_text(console, text):
+    return output_text(console, text, "ConsoleWriteError")
 
 
 def input_line(console):
+    if console._terminal_state is not None:
+        return Result("Err", Failure("InputError", "line input is unavailable in key input mode"))
     try:
         line = console.stdin.readline()
         if not line:
@@ -63,6 +97,54 @@ def input_line(console):
         line.encode("utf-8")
         return Result("Ok", line)
     except (OSError, UnicodeError, ValueError) as error:
+        return Result("Err", Failure("InputError", str(error)))
+
+
+def enable_key_input(console):
+    if console._terminal_state is not None:
+        return Result("Ok", True)
+    if termios is None or os.environ.get("TERM") == "dumb":
+        return Result("Ok", False)
+    try:
+        if not (console.stdin.isatty() and console.stdout.isatty()):
+            return Result("Ok", False)
+        fd = console.stdin.fileno()
+        decoder = codecs.getincrementaldecoder(console.stdin.encoding or "utf-8")(errors="replace")
+        console._terminal_state = (fd, termios.tcgetattr(fd))
+        try:
+            tty.setcbreak(fd, termios.TCSANOW)
+        except (OSError, termios.error):
+            console._terminal_state = None
+            raise
+        console._decoder = decoder
+        return Result("Ok", True)
+    except (OSError, ValueError, LookupError, termios.error) as error:
+        return Result("Err", Failure("TerminalModeError", str(error)))
+
+
+def read_keys_for(console, timeout):
+    if console._terminal_state is None:
+        return Result("Err", Failure("InputError", "key input requires an enabled terminal"))
+    if timeout < 0:
+        return Result("Err", Failure("InvalidTimeout", "expected a nonnegative duration"))
+    fd, _ = console._terminal_state
+    deadline = monotonic() + timeout / 1000
+    keys = []
+    try:
+        while True:
+            remaining = max(0, deadline - monotonic())
+            ready, _, _ = select([fd], [], [], remaining)
+            if not ready:
+                return Result("Ok", tuple(keys))
+            data = os.read(fd, 4096)
+            if not data:
+                if keys:
+                    return Result("Ok", tuple(keys))
+                return Result("Err", Failure("EndOfInput"))
+            keys.extend(console._decoder.decode(data))
+            if monotonic() >= deadline:
+                return Result("Ok", tuple(keys))
+    except (OSError, ValueError) as error:
         return Result("Err", Failure("InputError", str(error)))
 
 
@@ -126,7 +208,10 @@ def host_error_kind(error):
 
 BUILTINS = {
     "print": print_text,
+    "write": write_text,
     "input": input_line,
+    "enableKeyInput": enable_key_input,
+    "readKeysFor": read_keys_for,
     "readFileUTF8": read_file,
     "writeFileUTF8": write_file,
     "add": lambda left, right: checked_int(left + right),
