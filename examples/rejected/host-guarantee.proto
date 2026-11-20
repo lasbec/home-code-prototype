@@ -1,0 +1,3 @@
+terminates fn main(terminal: console) -> result<string, HostError> {
+    return input(terminal);
+}

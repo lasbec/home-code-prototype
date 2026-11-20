@@ -1,0 +1,8 @@
+fn update(refined: mut int32!0, unrestricted: mut int32) -> unit {
+    unrestricted = 0;
+}
+
+fn main() -> unit {
+    let mut number: int32 = 1;
+    update(refined: mut number, unrestricted: mut number);
+}

@@ -1,0 +1,37 @@
+// Unordered call arguments, units, nonzero evidence, and checked arithmetic.
+pure deterministic terminates fn speed(elapsed: int32!0<seconds>, distance: int32<meter>) -> f64<meter/seconds> {
+    return distance / elapsed as f64<meter/seconds>;
+}
+
+deterministic terminates fn setDuration(elapsed: mut int32!0<seconds>) -> unit {
+    elapsed = 3;
+}
+
+pure deterministic terminates commutative fn total(a: int32<seconds>, b: int32<seconds>) -> result<int32<seconds>, Overflow> {
+    return a + b;
+}
+
+pure deterministic terminates fn sum(items: list<int32<seconds>>) -> result<int32<seconds>, Overflow> {
+    let mut accumulator: int32<seconds> = 0;
+    for item in items {
+        match total(accumulator, item) {
+            Ok(next) { accumulator = next; }
+            Err(error) { return Err(error); }
+        }
+    }
+    return Ok(accumulator);
+}
+
+deterministic terminates fn main() -> list<f64<meter/seconds>> {
+    let mut elapsed: int32<seconds> = 0;
+    match sum([1, 2, 3]) {
+        Ok(value) { elapsed = value; }
+        Err(overflow) { return []; }
+    }
+    if elapsed != 0 {
+        setDuration(mut elapsed);
+        let distance: int32<meter> = -7;
+        return [speed(distance, elapsed)];
+    }
+    return [];
+}

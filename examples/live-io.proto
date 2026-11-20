@@ -1,0 +1,24 @@
+// The prompt, input, file write, and file read all happen during the run.
+fn echoFile(terminal: console, files: filesystem, path: string) -> result<unit, HostError> {
+    match print("Enter a line to save:", terminal) {
+        Ok(printed) {}
+        Err(error) { return Err(error); }
+    }
+    match input(terminal) {
+        Ok(line) {
+            match writeFileUTF8(text: line, files, path: path) {
+                Ok(written) {}
+                Err(error) { return Err(error); }
+            }
+        }
+        Err(error) { return Err(error); }
+    }
+    match readFileUTF8(path, files) {
+        Ok(contents) { return print(contents, terminal); }
+        Err(error) { return Err(error); }
+    }
+}
+
+fn main(terminal: console, files: filesystem) -> result<unit, HostError> {
+    return echoFile("prototype-output.txt", files, terminal);
+}
