@@ -30,6 +30,16 @@ python3 -B -m prototype run examples/live-io.proto --console --filesystem
 
 The host functions run immediately when called. `input` reads one line and returns `Err(EndOfInput)` at end of input. Host functions carry no function guarantees.
 
+## Play Snake
+
+```sh
+python3 -B -m prototype run examples/snake.proto --console --filesystem
+```
+
+Use `w`, `a`, `s`, or `d` followed by Enter to move. The head is `@`, the body is `o`, and food is `*`. Type `q` to abandon the round. The game saves completed rounds in `snake-scores.txt` in the current working directory and reads the best score on startup. The score file assumes one running game writes it at a time. A malformed or unreadable history disables saving for that run.
+
+Run the game and language checks with `python3 -B -m unittest discover -s tests`.
+
 ## Language rules
 
 - **Calls.** Names reserve parameter slots first. The checker matches unnamed arguments by type and reports ambiguity unless `commutative` applies. Argument expressions run in source order. `commutative` is an author promise on `pure deterministic` functions with two equally typed read-only parameters. The checker validates the signature and uses declaration order to resolve ties.
@@ -37,6 +47,8 @@ The host functions run immediately when called. `input` reads one line and retur
 - **Guarantees.** A caller that declares `pure`, `deterministic`, or `terminates` can only call functions that declare the same guarantee. `pure` allows local mutation and prohibits `mut` parameters and host calls. `terminates` rejects recursive call cycles. A `for item in items` loop runs over the list present at entry and protects the source variable from reassignment or mutable passage, including through possible aliases.
 - **Mutation.** A caller declares a writable variable with `let mut` and passes it as `mut variable` to a `mut` parameter. Matching mutable aliases share storage. A `mut int32!0` parameter must preserve the nonzero invariant. Passing a narrowed variable to `mut int32` discards its proof.
 - **Numbers.** Use `int32`, `int32!0`, or `f64`, optionally with units such as `int32<meter>`. Equal-unit `int32` addition and subtraction return a `result` with `Overflow` on out-of-range arithmetic. Use `a + b` or `add(a, b)` for commutative addition, and `subtract(left: a, right: b)` for subtraction. Division uses an `int32!0` divisor, produces a floating-point quotient, and requires an explicit result type such as `distance / elapsed as f64<meter/seconds>`. `if elapsed != 0` narrows the variable in that branch. `nonzero(elapsed)` returns the same proof as a `result`.
-- **Data and errors.** Use `bool`, `string`, `unit`, homogeneous `list<T>`, and `result<T, E>`. Lists are immutable values. `at(items, index)` uses zero-based indexing and returns `result<T, IndexError>`. A `match` on a `result` requires both `Ok(value)` and `Err(error)` arms. Error values can flow through function calls and returns. The language omits null and exceptions.
+- **Data and errors.** Use `bool`, `string`, `unit`, homogeneous `list<T>`, and `result<T, E>`. Records have named fields and enums have named cases with an optional typed payload. A `match` requires an arm for each result or enum case. Error values can flow through function calls and returns. The language omits null and exceptions.
+- **Iteration and collections.** Use `loop { ... }` for repeated work that exits via `return`. The checker forbids this construct in a `terminates` function. Lists are immutable. `prepend(item, items)` and `dropLast(items)` return new lists. `dropLast([])` returns an empty list. `at(items, index)` uses zero-based indexing and returns `result<T, IndexError>`.
+- **Text and host errors.** Use `concat(left: ..., right: ...)` to join strings, `splitLines` to split on LF or CRLF, and `formatInt32` and `parseInt32` to convert between strings and integers. Parsing returns a `result<int32, ParseIntError>`. `hostErrorKind` distinguishes `EndOfInput`, `FileNotFound`, and `Other`, and `describeHostError` formats the diagnostic.
 
 See the [glossary](GLOSSARY.md) and [decision records](docs/adr/) for the terms and design choices from the interview.

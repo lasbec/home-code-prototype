@@ -17,6 +17,19 @@ class Result:
 
 
 @dataclass(frozen=True)
+class Record:
+    name: str
+    fields: tuple
+
+
+@dataclass(frozen=True)
+class Variant:
+    name: str
+    tag: str
+    value: object = None
+
+
+@dataclass(frozen=True)
 class Failure:
     code: str
     message: str = ""
@@ -56,6 +69,8 @@ def input_line(console):
 def read_file(filesystem, path):
     try:
         return Result("Ok", Path(path).read_bytes().decode("utf-8"))
+    except FileNotFoundError as error:
+        return Result("Err", Failure("FileNotFound", str(error)))
     except (OSError, UnicodeError, ValueError) as error:
         return Result("Err", Failure("ReadError", str(error)))
 
@@ -84,6 +99,31 @@ def list_at(items, index):
     return Result("Err", Failure("IndexError", f"index {index} is outside the list"))
 
 
+def split_lines(text):
+    if not text:
+        return ()
+    return tuple(text.replace("\r\n", "\n").removesuffix("\n").split("\n"))
+
+
+def parse_int(text):
+    digits = text.removeprefix("-")
+    if not (digits.isascii() and digits.isdecimal()):
+        return Result("Err", Failure("ParseIntError", "expected a decimal integer"))
+    significant = digits.lstrip("0") or "0"
+    if len(significant) <= 10:
+        value = int(significant)
+        if text.startswith("-"):
+            value = -value
+        if -(2**31) <= value < 2**31:
+            return Result("Ok", value)
+    return Result("Err", Failure("ParseIntError", "integer is outside the int32 range"))
+
+
+def host_error_kind(error):
+    tag = error.code if error.code in {"EndOfInput", "FileNotFound"} else "Other"
+    return Variant("HostErrorKind", tag)
+
+
 BUILTINS = {
     "print": print_text,
     "input": input_line,
@@ -93,6 +133,14 @@ BUILTINS = {
     "subtract": lambda left, right: checked_int(left - right),
     "nonzero": nonzero,
     "at": list_at,
+    "prepend": lambda item, items: (item, *items),
+    "dropLast": lambda items: items[:-1],
+    "concat": lambda left, right: left + right,
+    "splitLines": split_lines,
+    "parseInt32": parse_int,
+    "formatInt32": str,
+    "hostErrorKind": host_error_kind,
+    "describeHostError": lambda error: display(error),
 }
 OPERATORS = {"==": eq, "!=": ne, "<": lt, ">": gt, "<=": le, ">=": ge, "/": truediv}
 
@@ -141,7 +189,15 @@ class Interpreter:
             subject, arms = fields
             result = self.expression(subject, environment)
             name, body = arms[result.tag]
-            return self.block(body, {**environment, name: Cell(result.value)})
+            scope = environment.copy()
+            if name is not None:
+                scope[name] = Cell(result.value)
+            return self.block(body, scope)
+        if kind == "loop":
+            while True:
+                returns, value = self.block(fields[0], environment.copy())
+                if returns:
+                    return True, value
         if kind == "for":
             name, source, body = fields
             for item in environment[source].value:
@@ -162,17 +218,31 @@ class Interpreter:
         if kind == "result":
             tag, value = fields
             return Result(tag, self.expression(value, environment))
+        if kind == "variant":
+            name, tag, payload = fields
+            value = None if payload is None else self.expression(payload, environment)
+            return Variant(name, tag, value)
+        if kind == "record":
+            name, labels, plan = fields
+            arguments = self.arguments(plan, environment)
+            return Record(name, tuple(zip(labels, arguments, strict=True)))
+        if kind == "field":
+            value, index = fields
+            return self.expression(value, environment).fields[index][1]
         if kind == "binary":
             left, right = fields
             return OPERATORS[node.token.text](self.expression(left, environment),
                                               self.expression(right, environment))
         if kind == "invoke":
             name, plan = fields
-            arguments = [None] * len(plan)
-            for slot, mutable, expression in plan:
-                arguments[slot] = environment[expression] if mutable else self.expression(expression, environment)
-            return self.call(name, arguments)
+            return self.call(name, self.arguments(plan, environment))
         raise AssertionError(kind)
+
+    def arguments(self, plan, environment):
+        arguments = [None] * len(plan)
+        for slot, mutable, expression in plan:
+            arguments[slot] = environment[expression] if mutable else self.expression(expression, environment)
+        return arguments
 
 
 def display(value):
@@ -182,6 +252,12 @@ def display(value):
         return "true" if value else "false"
     if isinstance(value, Result):
         return f"{value.tag}({display(value.value)})"
+    if isinstance(value, Variant):
+        tag = f"{value.name}::{value.tag}"
+        return tag if value.value is None else f"{tag}({display(value.value)})"
+    if isinstance(value, Record):
+        fields = ", ".join(f"{name}: {display(field)}" for name, field in value.fields)
+        return f"{value.name}({fields})"
     if isinstance(value, Failure):
         return f"{value.code}: {value.message}" if value.message else value.code
     if isinstance(value, tuple):

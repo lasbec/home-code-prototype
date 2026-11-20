@@ -56,11 +56,13 @@ OVERFLOW = Type("Overflow")
 ZERO = Type("Zero")
 INDEX_ERROR = Type("IndexError")
 HOST_ERROR = Type("HostError")
+HOST_ERROR_KIND = Type("HostErrorKind")
+PARSE_INT_ERROR = Type("ParseIntError")
 GUARANTEES = frozenset({"terminates", "deterministic", "pure"})
 MODIFIERS = GUARANTEES | {"commutative"}
 SIMPLE_TYPES = {
     item.name for item in (BOOL, STRING, UNIT, CONSOLE, FILESYSTEM, OVERFLOW, ZERO,
-                           INDEX_ERROR, HOST_ERROR)
+                           INDEX_ERROR, HOST_ERROR, HOST_ERROR_KIND, PARSE_INT_ERROR)
 }
 
 
@@ -107,6 +109,18 @@ class Function:
 
 
 @dataclass(frozen=True)
+class RecordDeclaration:
+    token: Token
+    fields: tuple
+
+
+@dataclass(frozen=True)
+class EnumDeclaration:
+    token: Token
+    variants: tuple
+
+
+@dataclass(frozen=True)
 class Argument:
     token: Token
     expression: Node
@@ -117,11 +131,11 @@ class Argument:
 TOKEN = re.compile(
     r'(?P<skip>\s+|//[^\n]*)|(?P<string>"(?:[^"\\\n]|\\[^\n])*")|'
     r'(?P<integer>[0-9]+)|(?P<name>[A-Za-z_][A-Za-z_0-9]*)|'
-    r'(?P<punct>!0|->|==|!=|<=|>=|[{}()\[\],:;=<>+*/-])|(?P<invalid>.)'
+    r'(?P<punct>!0|->|::|==|!=|<=|>=|[{}()\[\],.:;=<>+*/-])|(?P<invalid>.)'
 )
 RESERVED = MODIFIERS | {
     "fn", "mut", "let", "as", "return", "if", "else", "for", "in",
-    "match", "true", "false", "unit",
+    "match", "true", "false", "unit", "record", "enum", "loop",
 }
 PRECEDENCE = {"as": 0, "==": 1, "!=": 1, "<": 1, ">": 1, "<=": 1,
               ">=": 1, "+": 2, "-": 2, "/": 3}
@@ -149,6 +163,15 @@ class Parser:
     def __init__(self, source):
         self.tokens = list(tokenize(source))
         self.index = 0
+        self.data_types = set()
+        depth = 0
+        for index, token in enumerate(self.tokens):
+            if token.text == "{":
+                depth += 1
+            elif token.text == "}":
+                depth -= 1
+            elif not depth and token.text in {"record", "enum"}:
+                self.data_types.add(self.tokens[index + 1].text)
 
     @property
     def current(self):
@@ -178,8 +201,18 @@ class Parser:
         return token
 
     def program(self):
-        functions = []
+        declarations = []
         while self.current.kind:
+            if self.accept("record"):
+                name = self.name()
+                self.expect("{")
+                declarations.append(RecordDeclaration(name, self.separated("}", self.record_field)))
+                continue
+            if self.accept("enum"):
+                name = self.name()
+                self.expect("{")
+                declarations.append(EnumDeclaration(name, self.separated("}", self.variant)))
+                continue
             modifiers = set()
             while self.current.text in MODIFIERS:
                 token = self.take()
@@ -192,8 +225,8 @@ class Parser:
             parameters = self.separated(")", self.parameter)
             self.expect("->")
             output = self.type()
-            functions.append(Function(name, frozenset(modifiers), parameters, output, self.block()))
-        return tuple(functions)
+            declarations.append(Function(name, frozenset(modifiers), parameters, output, self.block()))
+        return tuple(declarations)
 
     def separated(self, end, read):
         items = []
@@ -209,6 +242,19 @@ class Parser:
         self.expect(":")
         mutable = bool(self.accept("mut"))
         return Parameter(name, self.type(), mutable)
+
+    def record_field(self):
+        name = self.name()
+        self.expect(":")
+        return Parameter(name, self.type())
+
+    def variant(self):
+        name = self.name()
+        payload = None
+        if self.accept("("):
+            payload = self.type()
+            self.expect(")")
+        return name, payload
 
     def type(self):
         token = self.take()
@@ -233,6 +279,8 @@ class Parser:
                 raise LanguageError(nonzero, "only int32 supports !0 in this prototype")
             units = self.units() if self.accept("<") else ()
             return Type(name, units=units, nonzero=bool(nonzero))
+        if name in self.data_types:
+            return Type(name)
         raise LanguageError(token, f"unknown type '{name}'")
 
     def units(self):
@@ -282,17 +330,18 @@ class Parser:
             self.expect("in")
             source = self.name()
             return Node(token, "for", (item, source, self.block()))
+        if self.accept("loop"):
+            return Node(token, "loop", (self.block(),))
         if self.accept("match"):
             subject = self.expression()
             self.expect("{")
             arms = []
             while not self.accept("}"):
-                tag = self.take()
-                if tag.text not in {"Ok", "Err"}:
-                    raise LanguageError(tag, "expected Ok or Err arm")
-                self.expect("(")
-                binding = self.name()
-                self.expect(")")
+                tag = self.name()
+                binding = None
+                if self.accept("("):
+                    binding = self.name()
+                    self.expect(")")
                 arms.append((tag, binding, self.block()))
             return Node(token, "match", (subject, tuple(arms)))
         if token.kind == "name" and self.tokens[self.index + 1].text == "=":
@@ -307,6 +356,9 @@ class Parser:
 
     def expression(self, precedence=0):
         left = self.primary()
+        while self.accept("."):
+            field = self.name()
+            left = Node(field, "field", (left,))
         while PRECEDENCE.get(self.current.text, -1) >= precedence:
             operator = self.take()
             if operator.text == "-":
@@ -346,6 +398,13 @@ class Parser:
         if token.text == "unit":
             return Node(token, "value", (None, UNIT))
         if token.kind == "name" and token.text not in RESERVED:
+            if self.accept("::"):
+                tag = self.name()
+                payload = None
+                if self.accept("("):
+                    payload = self.expression()
+                    self.expect(")")
+                return Node(tag, "variant", (token.text, payload))
             if self.accept("("):
                 return Node(token, "call", self.separated(")", self.argument))
             return Node(token, "variable", (token.text,))

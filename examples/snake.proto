@@ -1,0 +1,319 @@
+// Game rules and rendering use only data. The console and filesystem enter at main.
+record Position { x: int32, y: int32 }
+enum Direction { Up, Down, Left, Right }
+enum Food { Available(Position), Full }
+
+record Game {
+    head: Position,
+    body: list<Position>,
+    direction: Direction,
+    food: Food,
+    score: int32,
+}
+
+enum Turn { Moved(Game), Reversed, HitWall, HitBody, Won(Game) }
+enum Command { Move(Direction), Quit, Invalid }
+
+record ScoreHistory { text: string, best: int32 }
+enum Scores { Ready(ScoreHistory), Unavailable(string) }
+
+pure deterministic terminates fn columns() -> list<int32> {
+    return [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+}
+
+pure deterministic terminates fn rows() -> list<int32> {
+    return [0, 1, 2, 3, 4, 5, 6, 7];
+}
+
+pure deterministic terminates fn initialGame() -> Game {
+    return Game(
+        head: Position(x: 3, y: 3),
+        body: [Position(x: 2, y: 3), Position(x: 1, y: 3)],
+        direction: Direction::Right,
+        food: Food::Available(Position(x: 4, y: 3)),
+        score: 0,
+    );
+}
+
+pure deterministic terminates fn samePosition(first: Position, second: Position) -> bool {
+    if first.x != second.x { return false; }
+    return first.y == second.y;
+}
+
+pure deterministic terminates fn contains(positions: list<Position>, target: Position) -> bool {
+    for position in positions {
+        if samePosition(first: position, second: target) { return true; }
+    }
+    return false;
+}
+
+pure deterministic terminates fn isReverse(current: Direction, requested: Direction) -> bool {
+    match current {
+        Up { return requested == Direction::Down; }
+        Down { return requested == Direction::Up; }
+        Left { return requested == Direction::Right; }
+        Right { return requested == Direction::Left; }
+    }
+}
+
+pure deterministic terminates fn offset(direction: Direction) -> Position {
+    match direction {
+        Up { return Position(x: 0, y: -1); }
+        Down { return Position(x: 0, y: 1); }
+        Left { return Position(x: -1, y: 0); }
+        Right { return Position(x: 1, y: 0); }
+    }
+}
+
+pure deterministic terminates fn moveHead(head: Position, direction: Direction) -> result<Position, Overflow> {
+    let delta = offset(direction);
+    match head.x + delta.x {
+        Ok(x) {
+            match head.y + delta.y {
+                Ok(y) { return Ok(Position(x: x, y: y)); }
+                Err(error) { return Err(error); }
+            }
+        }
+        Err(error) { return Err(error); }
+    }
+}
+
+pure deterministic terminates fn insideBoard(position: Position) -> bool {
+    if position.x < 0 { return false; }
+    if position.x > 11 { return false; }
+    if position.y < 0 { return false; }
+    return position.y <= 7;
+}
+
+pure deterministic terminates fn foodAt(food: Food, position: Position) -> bool {
+    match food {
+        Available(target) { return samePosition(first: target, second: position); }
+        Full { return false; }
+    }
+}
+
+pure deterministic terminates fn nextFood(occupied: list<Position>) -> Food {
+    let xs = columns();
+    let ys = rows();
+    for y in ys {
+        for x in xs {
+            let cell = Position(x: x, y: y);
+            if contains(occupied, cell) == false { return Food::Available(cell); }
+        }
+    }
+    return Food::Full;
+}
+
+pure deterministic terminates fn grow(game: Game, head: Position, body: list<Position>, direction: Direction) -> result<Turn, Overflow> {
+    match game.score + 1 {
+        Ok(score) {
+            let food = nextFood(prepend(head, body));
+            let next = Game(head: head, body: body, direction: direction, food: food, score: score);
+            match food {
+                Available(position) { return Ok(Turn::Moved(next)); }
+                Full { return Ok(Turn::Won(next)); }
+            }
+        }
+        Err(error) { return Err(error); }
+    }
+}
+
+pure deterministic terminates fn advance(game: Game, direction: Direction) -> result<Turn, Overflow> {
+    if isReverse(current: game.direction, requested: direction) {
+        return Ok(Turn::Reversed);
+    }
+    match moveHead(game.head, direction) {
+        Ok(head) {
+            if insideBoard(head) == false { return Ok(Turn::HitWall); }
+
+            // Retain the tail only when the snake grows.
+            let body = prepend(game.head, game.body);
+            if foodAt(game.food, head) {
+                if contains(body, head) { return Ok(Turn::HitBody); }
+                return grow(game, head, body, direction);
+            }
+            let shortened = dropLast(body);
+            if contains(shortened, head) { return Ok(Turn::HitBody); }
+            return Ok(Turn::Moved(Game(
+                head: head, body: shortened, direction: direction, food: game.food, score: game.score,
+            )));
+        }
+        Err(error) { return Err(error); }
+    }
+}
+
+pure deterministic terminates fn tile(game: Game, cell: Position) -> string {
+    if samePosition(first: game.head, second: cell) { return "@"; }
+    if contains(game.body, cell) { return "o"; }
+    if foodAt(game.food, cell) { return "*"; }
+    return ".";
+}
+
+pure deterministic terminates fn render(game: Game) -> string {
+    let xs = columns();
+    let ys = rows();
+    let mut board = "";
+    for y in ys {
+        for x in xs {
+            board = concat(left: board, right: tile(game, Position(x: x, y: y)));
+        }
+        board = concat(left: board, right: "\n");
+    }
+    return concat(left: board, right: concat(left: "Score: ", right: formatInt32(game.score)));
+}
+
+pure deterministic terminates fn command(text: string) -> Command {
+    if text == "w" { return Command::Move(Direction::Up); }
+    if text == "a" { return Command::Move(Direction::Left); }
+    if text == "s" { return Command::Move(Direction::Down); }
+    if text == "d" { return Command::Move(Direction::Right); }
+    if text == "q" { return Command::Quit; }
+    return Command::Invalid;
+}
+
+// Scores are stored as one nonnegative decimal integer per line.
+pure deterministic terminates fn appendScore(text: string, score: int32) -> string {
+    let line = concat(left: formatInt32(score), right: "\n");
+    return concat(left: text, right: line);
+}
+
+pure deterministic terminates fn parseScores(text: string) -> Scores {
+    let lines = splitLines(text);
+    let mut best = 0;
+    let mut history = "";
+    for line in lines {
+        match parseInt32(line) {
+            Ok(score) {
+                if score < 0 { return Scores::Unavailable("The score file contains a negative score."); }
+                if score > best { best = score; }
+                history = appendScore(history, score);
+            }
+            Err(error) { return Scores::Unavailable("The score file contains an invalid score."); }
+        }
+    }
+    return Scores::Ready(ScoreHistory(text: history, best: best));
+}
+
+fn loadScores(files: filesystem, path: string) -> Scores {
+    match readFileUTF8(files, path) {
+        Ok(contents) { return parseScores(contents); }
+        Err(error) {
+            if hostErrorKind(error) == HostErrorKind::FileNotFound {
+                return Scores::Ready(ScoreHistory(text: "", best: 0));
+            }
+            return Scores::Unavailable(describeHostError(error));
+        }
+    }
+}
+
+fn printBest(terminal: console, scores: Scores) -> result<unit, HostError> {
+    match scores {
+        Ready(history) {
+            return print(terminal, concat(left: "Best score: ", right: formatInt32(history.best)));
+        }
+        Unavailable(reason) {
+            return print(terminal, concat(left: "Score saving disabled: ", right: reason));
+        }
+    }
+}
+
+fn saveScore(files: filesystem, path: string, scores: Scores, score: int32) -> string {
+    match scores {
+        Ready(history) {
+            match writeFileUTF8(files, path: path, text: appendScore(history.text, score)) {
+                Ok(written) { return "Score saved."; }
+                Err(error) {
+                    return concat(left: "Score not saved: ", right: describeHostError(error));
+                }
+            }
+        }
+        Unavailable(reason) { return "Score not saved."; }
+    }
+}
+
+fn finishRound(terminal: console, files: filesystem, path: string, scores: Scores, message: string, score: int32) -> result<unit, HostError> {
+    let finalLine = concat(left: " Final score: ", right: formatInt32(score));
+    let summary = concat(left: message, right: finalLine);
+    let status = saveScore(files, path, scores, score);
+    return print(terminal, concat(left: summary, right: concat(left: "\n", right: status)));
+}
+
+fn readCommand(terminal: console) -> result<Command, HostError> {
+    match input(terminal) {
+        Ok(text) { return Ok(command(text)); }
+        Err(error) {
+            if hostErrorKind(error) == HostErrorKind::EndOfInput { return Ok(Command::Quit); }
+            return Err(error);
+        }
+    }
+}
+
+fn play(terminal: console, files: filesystem, path: string) -> result<unit, HostError> {
+    let scores = loadScores(files, path);
+    match printBest(terminal, scores) {
+        Ok(printed) {}
+        Err(error) { return Err(error); }
+    }
+    match print(terminal, "Snake | w/a/s/d + Enter to move | q to quit") {
+        Ok(printed) {}
+        Err(error) { return Err(error); }
+    }
+
+    let mut game = initialGame();
+    let mut redraw = true;
+    loop {
+        if redraw {
+            match print(terminal, render(game)) {
+                Ok(printed) { redraw = false; }
+                Err(error) { return Err(error); }
+            }
+        }
+        match readCommand(terminal) {
+            Ok(next) {
+                match next {
+                    Quit { return print(terminal, "Round abandoned."); }
+                    Invalid {
+                        match print(terminal, "Enter w, a, s, d, or q.") {
+                            Ok(printed) {}
+                            Err(error) { return Err(error); }
+                        }
+                    }
+                    Move(direction) {
+                        match advance(game, direction) {
+                            Ok(turn) {
+                                match turn {
+                                    Moved(state) { game = state; redraw = true; }
+                                    Reversed {
+                                        match print(terminal, "The snake cannot reverse directly.") {
+                                            Ok(printed) {}
+                                            Err(error) { return Err(error); }
+                                        }
+                                    }
+                                    HitWall {
+                                        return finishRound(terminal, files, path: path, scores,
+                                                           message: "You hit a wall.", score: game.score);
+                                    }
+                                    HitBody {
+                                        return finishRound(terminal, files, path: path, scores,
+                                                           message: "You hit the snake.", score: game.score);
+                                    }
+                                    Won(state) {
+                                        let victory = concat(left: render(state), right: "\nYou filled the board!");
+                                        return finishRound(terminal, files, path: path, scores,
+                                                           message: victory, score: state.score);
+                                    }
+                                }
+                            }
+                            Err(overflow) { return print(terminal, "Game stopped after an arithmetic overflow."); }
+                        }
+                    }
+                }
+            }
+            Err(error) { return Err(error); }
+        }
+    }
+}
+
+fn main(terminal: console, files: filesystem) -> result<unit, HostError> {
+    return play(terminal, files, "snake-scores.txt");
+}

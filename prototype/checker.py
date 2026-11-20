@@ -3,9 +3,10 @@
 from dataclasses import dataclass, field
 
 from .syntax import (
-    BOOL, CONSOLE, FILESYSTEM, GUARANTEES, HOST_ERROR, INDEX_ERROR, INT, OVERFLOW,
-    STRING, UNIT, ZERO, Argument, Function, LanguageError, Node, Parameter, Token,
-    Type, quotient_units, result_type,
+    BOOL, CONSOLE, FILESYSTEM, GUARANTEES, HOST_ERROR, HOST_ERROR_KIND, INDEX_ERROR,
+    INT, OVERFLOW, PARSE_INT_ERROR, SIMPLE_TYPES, STRING, UNIT, ZERO, Argument,
+    EnumDeclaration, Function, LanguageError, Node, Parameter, RecordDeclaration,
+    Token, Type, quotient_units, result_type,
 )
 
 
@@ -26,8 +27,19 @@ HOST_FUNCTIONS = {
                 result_type(UNIT, HOST_ERROR)),
     )
 }
-GENERIC_FUNCTIONS = {"add", "subtract", "nonzero", "at"}
+PURE_FUNCTIONS = {
+    function.name: function for function in (
+        builtin("concat", (("left", STRING), ("right", STRING)), STRING, GUARANTEES),
+        builtin("splitLines", (("text", STRING),), Type("list", (STRING,)), GUARANTEES),
+        builtin("parseInt32", (("text", STRING),), result_type(INT, PARSE_INT_ERROR), GUARANTEES),
+        builtin("formatInt32", (("value", INT),), STRING, GUARANTEES),
+        builtin("hostErrorKind", (("error", HOST_ERROR),), HOST_ERROR_KIND, GUARANTEES),
+        builtin("describeHostError", (("error", HOST_ERROR),), STRING, GUARANTEES),
+    )
+}
+GENERIC_FUNCTIONS = {"add", "subtract", "nonzero", "at", "prepend", "dropLast"}
 CONSTRUCTORS = {"Ok", "Err"}
+BUILTIN_NAMES = HOST_FUNCTIONS.keys() | PURE_FUNCTIONS.keys() | GENERIC_FUNCTIONS | CONSTRUCTORS
 
 
 @dataclass(frozen=True)
@@ -111,16 +123,35 @@ def merge_proofs(flow, branches):
 
 
 class Checker:
-    def __init__(self, functions):
+    def __init__(self, declarations):
         self.functions = {}
+        self.records = {}
+        self.enums = {HOST_ERROR_KIND.name: {"EndOfInput": None, "FileNotFound": None, "Other": None}}
         self.current_function = None
-        for function in functions:
-            name = function.name
-            if (name in self.functions or name in HOST_FUNCTIONS or
-                    name in GENERIC_FUNCTIONS or name in CONSTRUCTORS):
-                raise LanguageError(function.token, f"function name '{name}' is already in use")
-            self.functions[name] = function
-            self.check_signature(function)
+        used_names = set(BUILTIN_NAMES)
+        builtin_types = SIMPLE_TYPES | {"int32", "f64", "result", "list"}
+        for declaration in declarations:
+            token = declaration.token
+            name = token.text
+            if name in used_names or (not isinstance(declaration, Function) and name in builtin_types):
+                raise LanguageError(token, f"name '{name}' is already in use")
+            used_names.add(name)
+            if isinstance(declaration, RecordDeclaration):
+                fields = [field.name for field in declaration.fields]
+                if len(fields) != len(set(fields)):
+                    raise LanguageError(token, f"record '{name}' has duplicate fields")
+                self.records[name] = builtin(name, ((f.name, f.type) for f in declaration.fields),
+                                             Type(name), GUARANTEES)
+            elif isinstance(declaration, EnumDeclaration):
+                variants = {tag.text: payload for tag, payload in declaration.variants}
+                if len(variants) != len(declaration.variants):
+                    raise LanguageError(token, f"enum '{name}' has duplicate variants")
+                if not variants:
+                    raise LanguageError(token, f"enum '{name}' needs at least one variant")
+                self.enums[name] = variants
+            else:
+                self.functions[name] = declaration
+                self.check_signature(declaration)
 
     def check_signature(self, function):
         if "pure" in function.modifiers and any(p.mutable for p in function.parameters):
@@ -220,41 +251,66 @@ class Checker:
             merge_proofs(flow, ((yes_flow, yes_returns), (no_flow, no_returns)))
             return Node(node.token, kind, (value.node, yes_body, no_body)), yes_returns and no_returns
         elif kind == "match":
-            subject, arms = fields
-            value = self.expression(subject, flow)
-            if value.type.name != "result":
-                raise LanguageError(subject.token, "match requires a result value")
-            if sorted(tag.text for tag, _, _ in arms) != ["Err", "Ok"]:
-                raise LanguageError(node.token, "match requires exactly one Ok arm and one Err arm")
-            branches = []
-            lowered_arms = {}
-            for tag, binding, body in arms:
-                branch = flow.copy()
-                branch.define(binding, value.type.arguments[tag.text == "Err"])
-                lowered_body, returns = self.block(body, branch)
-                branches.append((branch, returns))
-                lowered_arms[tag.text] = (binding.text, lowered_body)
-            merge_proofs(flow, branches)
-            return Node(node.token, kind, (value.node, lowered_arms)), all(end for _, end in branches)
+            return self.match_statement(node, flow)
         elif kind == "for":
             item, source, body = fields
             binding = flow.require(source, source.text)
             if binding.type.name != "list":
                 raise LanguageError(source, "for requires a list variable")
-            # A proof at the loop head must hold on entry and on every backedge.
-            while True:
-                loop = flow.copy()
-                loop.protected |= {source.text}
-                loop.define(item, binding.type.arguments[0])
-                lowered_body, returns = self.block(body, loop)
-                preserved = flow.nonzero if returns else flow.nonzero & loop.nonzero
-                if preserved == flow.nonzero:
-                    break
-                flow.nonzero = preserved
+            loop = flow.copy()
+            loop.protected |= {source.text}
+            loop.define(item, binding.type.arguments[0])
+            lowered_body = self.loop_body(body, loop)
+            flow.nonzero = loop.nonzero
             lowered = (item.text, source.text, lowered_body)
+        elif kind == "loop":
+            if "terminates" in self.current_function.modifiers:
+                raise LanguageError(node.token, "an unbounded loop cannot guarantee termination")
+            lowered_body = self.loop_body(fields[0], flow)
+            return Node(node.token, kind, (lowered_body,)), True
         else:
             raise AssertionError(kind)
         return Node(node.token, kind, lowered), False
+
+    def loop_body(self, body, flow):
+        # A proof at the loop head must hold on entry and on every backedge.
+        while True:
+            iteration = flow.copy()
+            lowered, ends = self.block(body, iteration)
+            if ends or flow.nonzero <= iteration.nonzero:
+                return lowered
+            flow.nonzero &= iteration.nonzero
+
+    def match_statement(self, node, flow):
+        subject, arms = node.fields
+        value = self.expression(subject, flow)
+        variants = self.enums.get(value.type.name)
+        if value.type.name == "result":
+            variants = dict(zip(("Ok", "Err"), value.type.arguments))
+        if variants is None:
+            raise LanguageError(subject.token, "match requires a result or enum value")
+        branches = []
+        lowered = {}
+        for tag, binding, body in arms:
+            if tag.text not in variants:
+                raise LanguageError(tag, f"'{tag.text}' is not a case of {value.type}")
+            if tag.text in lowered:
+                raise LanguageError(tag, f"duplicate match arm '{tag.text}'")
+            payload = variants[tag.text]
+            if (binding is None) != (payload is None):
+                requirement = "cannot have" if payload is None else "needs"
+                raise LanguageError(tag, f"'{tag.text}' {requirement} a payload binding")
+            branch = flow.copy()
+            if binding is not None:
+                branch.define(binding, payload)
+            lowered_body, ends = self.block(body, branch)
+            branches.append((branch, ends))
+            lowered[tag.text] = (binding.text if binding is not None else None, lowered_body)
+        missing = variants.keys() - lowered.keys()
+        if missing:
+            raise LanguageError(node.token, f"match is missing arm(s): {', '.join(sorted(missing))}")
+        merge_proofs(flow, branches)
+        return Node(node.token, node.kind, (value.node, lowered)), all(ends for _, ends in branches)
 
     def narrow(self, condition, yes, no):
         if condition.kind != "binary" or condition.token.text not in {"==", "!="}:
@@ -294,8 +350,7 @@ class Checker:
             return Checked(base.refined() if value else base, Node(node.token, "value", (value,)))
         if kind == "variable":
             name, = fields
-            if name not in flow.bindings and (
-                    name in self.functions or name in HOST_FUNCTIONS or name in GENERIC_FUNCTIONS):
+            if name not in flow.bindings and (name in self.functions or name in BUILTIN_NAMES):
                 raise LanguageError(node.token, "a function cannot be used as a data value")
             flow.require(node.token, name)
             return Checked(flow.type_of(name), node)
@@ -307,6 +362,26 @@ class Checker:
             return Checked(annotation, value.node)
         if kind == "list":
             return self.list_expression(node, flow, expected)
+        if kind == "field":
+            record = self.expression(fields[0], flow)
+            signature = self.records.get(record.type.name)
+            if signature is not None:
+                for index, field in enumerate(signature.parameters):
+                    if field.name == node.token.text:
+                        return Checked(field.type, Node(node.token, kind, (record.node, index)))
+            raise LanguageError(node.token, f"{record.type} has no field '{node.token.text}'")
+        if kind == "variant":
+            name, expression = fields
+            tag = node.token.text
+            variants = self.enums.get(name, {})
+            if tag not in variants:
+                raise LanguageError(node.token, f"unknown enum case '{name}::{tag}'")
+            payload = variants[tag]
+            if (expression is None) != (payload is None):
+                requirement = "cannot have" if payload is None else "needs"
+                raise LanguageError(node.token, f"'{name}::{tag}' {requirement} a payload")
+            value = None if expression is None else self.expression(expression, flow, payload).node
+            return Checked(Type(name), Node(node.token, kind, (name, tag, value)))
         if kind == "call":
             return self.call(node, flow, expected)
         if kind == "binary":
@@ -346,8 +421,13 @@ class Checker:
 
     def comparison(self, node, flow):
         left_node, right_node = node.fields
-        hint = self.type_hint(node.fields, flow, "int32") or INT
+        equality = node.token.text in {"==", "!="}
+        hint = self.type_hint(node.fields, flow, None if equality else "int32") or INT
         base = hint.without_refinement()
+        if base.name != "int32" and base not in {STRING, BOOL}:
+            variants = self.enums.get(base.name)
+            if variants is None or any(payload is not None for payload in variants.values()):
+                raise LanguageError(node.token, f"comparison is unavailable for {base}")
         left = self.expression(left_node, flow, base)
         right = self.expression(right_node, flow, base)
         return Checked(BOOL, Node(node.token, "binary", (left.node, right.node)))
@@ -380,14 +460,18 @@ class Checker:
         return Checked(annotation, Node(node.token, "binary", (left.node, right.node)))
 
     def generic_signature(self, name, arguments, flow, expected):
-        if name == "at":
+        if name in {"at", "dropLast"}:
             items = self.type_hint(
                 (arg.expression for arg in arguments if arg.label in {None, "items"}), flow, "list"
             )
-            if items is None and expected and expected.name == "result":
+            if name == "at" and items is None and expected and expected.name == "result":
                 items = Type("list", (expected.arguments[0],))
+            if name == "dropLast" and items is None and expected and expected.name == "list":
+                items = expected
             if items is None:
                 items = Type("list", (INT,))
+            if name == "dropLast":
+                return builtin(name, (("items", items),), items, GUARANTEES)
             return builtin(name, (("items", items), ("index", INT)),
                            result_type(items.arguments[0], INDEX_ERROR), GUARANTEES)
         hint = self.type_hint((arg.expression for arg in arguments), flow, "int32")
@@ -411,7 +495,11 @@ class Checker:
                 raise LanguageError(node.token, f"{name} needs an explicit result type")
             value = self.expression(arguments[0].expression, flow, expected.arguments[name == "Err"])
             return Checked(expected, Node(node.token, "result", (name, value.node)))
-        signature = self.functions.get(name) or HOST_FUNCTIONS.get(name)
+        if name in self.records:
+            return self.construct_record(node, name, flow)
+        if name == "prepend":
+            return self.prepend(node, flow, expected)
+        signature = self.functions.get(name) or HOST_FUNCTIONS.get(name) or PURE_FUNCTIONS.get(name)
         if name in GENERIC_FUNCTIONS:
             signature = self.generic_signature(name, arguments, flow, expected)
         if signature is None:
@@ -421,6 +509,50 @@ class Checker:
             guarantees = ", ".join(sorted(missing))
             raise LanguageError(node.token, f"'{name}' lacks required guarantee(s): {guarantees}")
         return self.bind_arguments(node, name, signature, flow)
+
+    def construct_record(self, node, name, flow):
+        signature = self.records[name]
+        if any(argument.label is None for argument in node.fields):
+            raise LanguageError(node.token, f"'{name}' requires named fields")
+        value = self.bind_arguments(node, name, signature, flow)
+        _, plan = value.node.fields
+        fields = tuple(parameter.name for parameter in signature.parameters)
+        return Checked(signature.output, Node(node.token, "record", (name, fields, plan)))
+
+    def prepend(self, node, flow, expected):
+        candidates = []
+        for argument in node.fields:
+            inferred = self.type_hint((argument.expression,), flow)
+            if inferred is None:
+                continue
+            if argument.label in {None, "items"} and inferred.name == "list":
+                candidates.append(inferred)
+            if argument.label in {None, "item"}:
+                candidates.append(Type("list", (inferred.without_refinement(),)))
+        if expected and expected.name == "list":
+            candidates = [expected]
+        candidates = list(dict.fromkeys(candidates or [Type("list", (INT,))]))
+        solutions = []
+        errors = []
+        for items in candidates:
+            signature = builtin("prepend", (("item", items.arguments[0]), ("items", items)),
+                                items, GUARANTEES)
+            trial = flow.copy()
+            try:
+                value = self.bind_arguments(node, "prepend", signature, trial)
+            except LanguageError as error:
+                if str(error).startswith("ambiguous call"):
+                    raise
+                errors.append(error)
+            else:
+                solutions.append((value, trial))
+        if not solutions:
+            raise errors[0]
+        if len(solutions) > 1:
+            raise LanguageError(node.token, "prepend has multiple possible list types; add an explicit type")
+        value, trial = solutions[0]
+        flow.nonzero = trial.nonzero
+        return value
 
     def bind_arguments(self, node, name, signature, flow):
         arguments, parameters = node.fields, signature.parameters
