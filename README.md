@@ -39,7 +39,7 @@ The host functions run immediately when called. `write` flushes text as supplied
 python3 -B -m prototype run examples/snake.proto --console --filesystem
 ```
 
-On a supported Unix terminal, Snake advances automatically about every 150 ms and redraws in place. Press `w`, `a`, `s`, or `d` to steer and `q` to quit. With redirected streams or an unsupported terminal, use those commands followed by Enter. The head is `@`, the body is `o`, and food is `*`.
+The board is 48 columns wide and 32 rows high. On a supported Unix terminal, Snake advances automatically about every 150 ms and redraws in place. Press `w`, `a`, `s`, or `d` to steer and `q` to quit. With redirected streams or an unsupported terminal, use those commands followed by Enter. The head is `@`, the body is `o`, and food is `*`.
 
 The game saves completed rounds in `snake-scores.txt` in the current working directory and reads the best score on startup. The score file assumes one running game writes it at a time. A malformed or unreadable history disables saving for that run.
 

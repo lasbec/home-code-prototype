@@ -64,9 +64,12 @@ class SnakeRules(unittest.TestCase):
         self.assertEqual(grown["food"].value, position(0, 0))
 
     def test_wall_and_body_collisions_and_departing_tail(self):
-        edge = game(position(11, 4), (position(10, 4), position(9, 4)),
+        edge = game(position(47, 4), (position(46, 4), position(45, 4)),
                     "Right", position(0, 0))
         self.step(edge, "Right", "HitWall")
+        bottom = game(position(4, 31), (position(4, 30), position(4, 29)),
+                      "Down", position(0, 0))
+        self.step(bottom, "Down", "HitWall")
 
         body = (position(2, 3), position(3, 3), position(3, 2))
         corner = game(position(2, 2), body, "Up", position(0, 0))
@@ -78,13 +81,19 @@ class SnakeRules(unittest.TestCase):
         self.step(longer, "Right", "HitBody")
 
     def test_last_free_cell_wins(self):
-        path = [position(x, y) for y in range(8)
-                for x in (range(12) if y % 2 == 0 else range(11, -1, -1))]
-        nearly_full = game(path[-2], tuple(reversed(path[:-2])), "Left", path[-1], 92)
+        path = [position(x, y) for y in range(32)
+                for x in (range(48) if y % 2 == 0 else range(47, -1, -1))]
+        nearly_full = game(path[-2], tuple(reversed(path[:-2])), "Left", path[-1], len(path) - 4)
         finished = self.step(nearly_full, "Left", "Won")
-        self.assertEqual(finished["score"], 93)
+        self.assertEqual(finished["score"], len(path) - 3)
         self.assertEqual(finished["food"].tag, "Full")
-        self.assertEqual(len(finished["body"]), 95)
+        self.assertEqual(len(finished["body"]), len(path) - 1)
+
+    def test_board_renders_48_columns_and_32_rows(self):
+        initial = self.interpreter.call("initialGame", ())
+        *rows, score = self.interpreter.call("render", (initial,)).splitlines()
+        self.assertEqual([len(row) for row in rows], [48] * 32)
+        self.assertEqual(score, "Score: 0")
 
     def test_timed_key_batch_uses_latest_move_legal_at_start_of_tick(self):
         cases = (
@@ -102,7 +111,7 @@ class SnakeRules(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory, "scores.txt")
             target.write_text("7\n", encoding="utf-8")
-            terminal = Console(StringIO("d\n" * 9), StringIO())
+            terminal = Console(StringIO("d\n" + "w\n" * 4), StringIO())
             with patch("prototype.runtime.Path.write_bytes", side_effect=PermissionError("read only")):
                 result = self.interpreter.call("play", (terminal, Filesystem(), str(target)))
             output = terminal.stdout.getvalue()
@@ -129,7 +138,7 @@ class SnakePersistence(unittest.TestCase):
         return result.stdout
 
     def test_completed_rounds_persist_between_runs(self):
-        first = self.play("d\n" * 9)
+        first = self.play("d\n" + "w\n" * 4)
         self.assertIn("Best score: 0", first)
         self.assertIn("You hit a wall. Final score: 1", first)
         self.assertIn("Score saved.", first)

@@ -56,7 +56,9 @@ class TerminalSnake(unittest.TestCase):
     def test_idle_ticks_redraw_and_save_a_completed_round(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.run_terminal(SNAKE, directory) as (process, master, slave, original):
-                output = self.read_until(master, b"Score saved.")
+                output = self.read_until(master, b"Score: 1")
+                os.write(master, b"w")
+                output += self.read_until(master, b"Score saved.")
                 self.assertEqual(process.wait(timeout=5), 0)
                 self.assertEqual(process.stderr.read(), b"")
                 self.assertEqual(termios.tcgetattr(slave), original)
