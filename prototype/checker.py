@@ -296,18 +296,25 @@ class Checker:
         for argument in value_type.arguments:
             self.check_public_type(argument, token)
 
-    def contains_exclusive(self, value_type, seen=frozenset()):
-        if value_type.is_shared or value_type in seen:
+    def contains_type(self, value_type, matches, *, descend_handles=False, seen=frozenset()):
+        if matches(value_type):
+            return True
+        if value_type in seen or (value_type.is_shared and not descend_handles):
             return False
-        if value_type.name in CAPABILITIES and value_type.module is None:
-            return not value_type.shared
         if value_type in self.records:
             members = (field.type for field in self.records[value_type].parameters)
         elif value_type in self.enums:
             members = (payload for payload in self.enums[value_type].values() if payload is not None)
         else:
             members = value_type.arguments
-        return any(self.contains_exclusive(member, seen | {value_type}) for member in members)
+        return any(self.contains_type(member, matches, descend_handles=descend_handles,
+                                      seen=seen | {value_type}) for member in members)
+
+    def contains_exclusive(self, value_type):
+        return self.contains_type(value_type, lambda item: item in CAPABILITIES.values())
+
+    def contains_local(self, value_type):
+        return self.contains_type(value_type, lambda item: item.is_local, descend_handles=True)
 
     def check_signature(self, function, entry):
         if function.examples and not {"deterministic", "ending"} <= function.modifiers:
@@ -336,6 +343,8 @@ class Checker:
     def program(self):
         checked = {}
         for function in self.functions.values():
+            if self.contains_local(function.output):
+                raise LanguageError(function.token, "local values cannot escape through a return")
             self.current_function = function
             for parameter in function.parameters:
                 if parameter.owning and parameter.type.is_shared:
@@ -487,14 +496,18 @@ class Checker:
                 return
             active.add(function.key)
             for node in walk(function.body):
-                if not isinstance(node, Node) or node.kind != "invoke":
+                if not isinstance(node, Node) or node.kind not in {"invoke", "thread"}:
                     continue
-                name, _, _ = node.fields
-                if name in active:
+                callee = checked.get(node.fields[0])
+                if callee is None:
+                    continue
+                if node.kind == "thread" and "ending" not in callee.modifiers:
+                    continue
+                if callee.key in active:
+                    action = "thread start" if node.kind == "thread" else "call"
                     raise LanguageError(node.token,
-                                        f"recursive call to '{checked[name].name}' cannot guarantee termination")
-                if name in checked:
-                    visit(checked[name])
+                                        f"recursive {action} to '{callee.name}' cannot guarantee termination")
+                visit(callee)
             active.remove(function.key)
             proved.add(function.key)
 
@@ -900,16 +913,19 @@ class Checker:
         task = self.functions.get(name) or self.imported_functions.get(name)
         if task is None:
             raise LanguageError(node.token, f"unknown task '{name}'")
-        if self.contains_exclusive(task.output):
+        if self.contains_exclusive(task.output) or self.contains_local(task.output):
             raise LanguageError(node.token, "a task must return a shareable value")
         for parameter in task.parameters:
             if parameter.mutable:
                 raise LanguageError(node.token, "a task cannot accept mut arguments")
+            if self.contains_local(parameter.type):
+                raise LanguageError(node.token, "local values cannot escape through task arguments")
             if self.contains_exclusive(parameter.type) and not parameter.owning:
                 raise LanguageError(node.token, f"exclusive task parameter '{parameter.name}' requires own")
         call = self.bind_arguments(node, name, task, flow, starting=True)
-        lowered = Node(node.token, "thread", (*call.node.fields, capabilities[0]))
-        return Checked(Type("Thread", (task.output,)), lowered, call.call)
+        ending = "ending" in task.modifiers
+        lowered = Node(node.token, "thread", (*call.node.fields, capabilities[0], ending))
+        return Checked(threads.handle_type(task.output, ending=ending), lowered, call.call)
 
     def call(self, node, flow, expected, name=None, *, deferred=False):
         name = name or node.token.text
@@ -948,9 +964,13 @@ class Checker:
                 if (handle := self.type_hint((arg.expression,), flow, channels.HANDLES)) is not None
             )
             candidates = channels.signatures(node, handles, expected)
+            if any(self.contains_local(signature.output if channels.OPERATIONS[name].action == "create"
+                                       else signature.parameters[0].type) for signature in candidates):
+                raise LanguageError(node.token, "channel messages cannot contain local values")
             return self.bind_candidates(node, name, candidates, flow, deferred=deferred)
         if name in threads.OPERATIONS:
-            handle = self.type_hint((arg.expression for arg in arguments), flow, {"Thread"})
+            handles = {threads.handle_name(ending=name in threads.LOCAL_OPERATIONS)}
+            handle = self.type_hint((arg.expression for arg in arguments), flow, handles)
             signature = threads.signature(node, handle)
         if name in GENERIC_FUNCTIONS:
             signature = self.generic_signature(name, arguments, flow, expected)
@@ -1075,6 +1095,10 @@ class Checker:
                 parameter = parameters[index]
                 candidate = trial.copy()
                 try:
+                    if self.contains_local(parameter.type) and not (
+                        deferred or name in threads.LOCAL_OPERATIONS or name in self.record_names
+                    ):
+                        raise LanguageError(argument.token, "local values cannot escape through ordinary arguments")
                     value = self.check_argument(argument, parameter, candidate,
                                                 transfer=transfer or name in {"at", "dropLast"},
                                                 starting=starting)

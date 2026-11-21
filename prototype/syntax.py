@@ -38,6 +38,8 @@ class Type:
         name = self.name if self.module is None else f"{Path(self.module).stem}.{self.name}"
         if self.shared:
             name = f"shared {name}"
+        if self.is_local:
+            name = f"local {name}"
         name += "!0" if self.nonzero else ""
         if self.arguments:
             return f"{name}<{', '.join(map(str, self.arguments))}>"
@@ -53,6 +55,10 @@ class Type:
     @property
     def is_shared(self):
         return self.shared or (self.module is None and self.name in SHARED_HANDLES)
+
+    @property
+    def is_local(self):
+        return self.module is None and self.name == "EndingThread"
 
     def without_refinement(self):
         return replace(self, nonzero=False)
@@ -80,7 +86,7 @@ MOCK_CAPABILITIES = {capability.name: capability for capability in (CONSOLE, FIL
 CAPABILITIES = {**MOCK_CAPABILITIES, THREADS.name: THREADS, CHANNELS.name: CHANNELS}
 SHARED_HANDLES = {"Thread"} | CHANNEL_HANDLES
 GENERIC_TYPES = {
-    "list": 1, "result": 2, "Thread": 1,
+    "list": 1, "result": 2, "Thread": 1, "EndingThread": 1,
     **dict.fromkeys(CHANNEL_HANDLES, 1),
     **{name: 1 for name, operation in CHANNEL_ERRORS.items() if operation.carries_message},
 }
@@ -421,15 +427,19 @@ class Parser:
         return name, payload
 
     def type(self):
-        shared = self.accept("shared") if self.tokens[self.index + 1].kind == "name" else None
+        qualified = self.tokens[self.index + 1].kind == "name"
+        shared = bool(qualified and self.accept("shared"))
+        local = bool(qualified and not shared and self.accept("local"))
         token = self.qualified_name(self.take())
         name = token.text
         if shared and name not in CAPABILITIES:
-            raise LanguageError(shared, "shared qualifies a host capability")
+            raise LanguageError(token, "shared qualifies a host capability")
+        if local != (name == "EndingThread"):
+            raise LanguageError(token, "use local EndingThread<T> for a thread-local handle")
         if self.mock and name in CAPABILITIES:
             raise LanguageError(token, f"mock files cannot use host capability type '{name}'")
         if name in SIMPLE_TYPES:
-            return Type(name, shared=bool(shared))
+            return Type(name, shared=shared)
         if name in GENERIC_TYPES:
             self.type_angle("<")
             arguments = [self.type()]

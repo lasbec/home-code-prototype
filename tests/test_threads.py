@@ -247,3 +247,110 @@ class GreenThreads(unittest.TestCase):
     def test_ending_cannot_defer_an_ordinary_kill(self):
         with self.assertRaisesRegex(LanguageError, "lacks required guarantee.*ending"):
             compile_program("ending fn stop(target: Thread<unit>) -> unit { defer kill(target); }")
+
+    def test_ending_task_join_and_one_way_sharing(self):
+        program = compile_program("""
+            ending fn child(message: int32) -> int32 { return message; }
+            ending fn wait(workers: threads) -> result<int32, Killed> {
+                let handle: local EndingThread<int32> = thread child(42);
+                return join_ending(handle);
+            }
+            ending fn shared_task(workers: threads) -> Thread<int32> {
+                let handle = thread child(23);
+                return share_thread(handle);
+            }
+            fn main(workers: threads) -> result<int32, Killed> {
+                return join(shared_task(workers));
+            }
+        """)
+        interpreter = Interpreter(program)
+        self.assertEqual(display(interpreter.call("wait", (Threads(),))), "Ok(42)")
+        self.assertEqual(display(interpreter.call("main", (Threads(),))), "Ok(23)")
+
+    def test_ending_defer_can_capture_a_local_handle_and_run_its_cleanup(self):
+        program = compile_program("""
+            ending fn child(hold: Channel<int32>, done: Channel<int32>) -> unit {
+                defer try_send(done, 42);
+                receive_timeout(hold, 1000);
+            }
+            ending fn stop(target: local EndingThread<unit>) -> unit { kill_ending(target); }
+            ending fn parent(workers: threads, hold: Channel<int32>, done: Channel<int32>) -> unit {
+                let target = thread child(hold: hold, done: done);
+                defer stop(target);
+                unit;
+                unit;
+            }
+            fn main(workers: threads, channels: channels) -> result<int32, Empty> {
+                let hold: Channel<int32> = create_channel(channels, Capacity::Bounded(1));
+                let done: Channel<int32> = create_channel(channels, Capacity::Bounded(1));
+                parent(workers, hold: hold, done: done);
+                return try_receive(done);
+            }
+        """)
+        interpreter = Interpreter(program, clock=lambda: 0.0, idle=self.fail)
+        self.assertEqual(display(interpreter.call("main", (Threads(), Channels()))), "Ok(42)")
+
+    def test_kill_ending_does_not_wait_for_an_ordinary_descendant(self):
+        program = compile_program("""
+            fn clean(gate: Channel<int32>, output: shared console) -> unit {
+                print(output, "descendant cleanup starts");
+                receive_blocking(gate);
+                print(output, "descendant cleanup finishes");
+            }
+            fn ordinary(gate: Channel<int32>, ready: Channel<int32>, output: shared console) -> unit {
+                defer clean(gate, output);
+                try_send(ready, 1);
+                loop {}
+            }
+            ending fn parent(workers: shared threads, gate: Channel<int32>, ready: Channel<int32>,
+                             hold: Channel<int32>, output: shared console) -> unit {
+                thread ordinary(gate: gate, ready: ready, output: output);
+                receive_timeout(hold, 1000);
+            }
+            fn main(workers: shared threads, channels: channels, output: shared console) -> result<unit, Killed> {
+                let gate: Channel<int32> = create_channel(channels, Capacity::Bounded(1));
+                let ready: Channel<int32> = create_channel(channels, Capacity::Bounded(1));
+                let hold: Channel<int32> = create_channel(channels, Capacity::Bounded(1));
+                let target = thread parent(workers, gate: gate, ready: ready, hold: hold, output: output);
+                receive_blocking(ready);
+                kill_ending(target);
+                print(output, "target cleanup finished");
+                try_send(gate, 1);
+                return join_ending(target);
+            }
+        """)
+        output = StringIO()
+        interpreter = Interpreter(program, clock=lambda: 0.0, idle=self.fail)
+        result = interpreter.call("main", (Threads(), Channels(), Console(StringIO(), output)))
+        self.assertEqual(display(result), "Err(Killed)")
+        self.assertEqual(output.getvalue().splitlines()[-1], "descendant cleanup finishes")
+        self.assertIn("target cleanup finished", output.getvalue())
+
+    def test_local_handles_cannot_escape_or_create_unbounded_ending_waits(self):
+        prelude = "ending fn done() -> unit {}"
+        cases = (
+            ("""fn leak(w: threads) -> local EndingThread<unit> { return thread done(); }""",
+             "cannot escape through a return"),
+            ("""record Box { nested: list<local EndingThread<unit>> }
+                fn leak(w: threads) -> Box { return Box(nested: [thread done()]); }""",
+             "cannot escape through a return"),
+            ("""fn consume(t: local EndingThread<unit>) -> unit {}
+                fn leak(w: threads) -> unit { consume(thread done()); }""",
+             "cannot escape through ordinary arguments"),
+            ("""fn consume(t: list<local EndingThread<unit>>) -> unit {}
+                fn leak(w: threads) -> unit { thread consume([thread done()]); }""",
+             "cannot escape through task arguments"),
+            ("""fn leak(c: channels) -> unit {
+                    let q: Channel<list<local EndingThread<unit>>> = create_channel(c, Capacity::Unbounded);
+                }""", "channel messages cannot contain local"),
+            ("""fn leak(w: threads) -> unit { join(thread done()); }""",
+             "join requires a Thread"),
+            ("""fn leak(w: threads) -> unit { join_ending(share_thread(thread done())); }""",
+             "join_ending requires a local EndingThread"),
+            ("""ending fn recurse(w: shared threads) -> unit { join_ending(thread recurse(w)); }""",
+             "recursive thread start"),
+        )
+        for source, diagnostic in cases:
+            with self.subTest(source=source):
+                with self.assertRaisesRegex(LanguageError, diagnostic):
+                    compile_program(prelude + source)

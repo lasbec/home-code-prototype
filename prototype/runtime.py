@@ -15,6 +15,7 @@ from .channels import buffer as channels
 from .channels.api import OPERATIONS as CHANNEL_OPERATIONS
 from .checker import HOST_FUNCTIONS
 from .syntax import EXAMPLE_ERROR_MESSAGES, INTEGER_BOUNDS
+from .threads import signatures as threads
 from .threads.scheduler import Cancelled, Scheduler
 from .values import Failure, Result, Variant
 
@@ -319,10 +320,8 @@ class Interpreter:
     def invoke(self, name, arguments, scheduler):
         if name in CHANNEL_OPERATIONS:
             return (yield from channels.invoke(name, arguments, scheduler))
-        if name == "join":
-            return (yield from scheduler.join(*arguments))
-        if name == "kill":
-            return (yield from scheduler.kill(*arguments))
+        if name in threads.OPERATIONS:
+            return (yield from scheduler.invoke(name, *arguments))
         if name in HOST_FUNCTIONS and isinstance(arguments[0], MockCapability):
             capability = arguments[0]
             return self.call((capability.module, name), (capability.state, *arguments[1:]))
@@ -474,10 +473,10 @@ class Interpreter:
                 return checked_int(first * second, integer[0])
             return OPERATORS[node.token.text](first, second)
         if kind == "thread":
-            name, plan, _, capability = fields
+            name, plan, _, capability, ending = fields
             owner = environment[capability].value
             arguments = yield from self.arguments(plan, environment, scheduler)
-            return owner.start(scheduler, self.invoke(name, arguments, scheduler))
+            return owner.start(scheduler, self.invoke(name, arguments, scheduler), ending=ending)
         if kind == "invoke":
             name, plan, _ = fields
             arguments = yield from self.arguments(plan, environment, scheduler)

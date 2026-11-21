@@ -37,9 +37,19 @@ class Thread:
         return f"Thread({self.number})"
 
 
+@dataclass(frozen=True)
+class EndingThread:
+    target: Thread
+    owner: Thread
+
+    def __str__(self):
+        return f"EndingThread({self.target.number})"
+
+
 class Threads:
-    def start(self, scheduler, code):
-        return scheduler.start(code)
+    def start(self, scheduler, code, *, ending=False):
+        target = scheduler.start(code)
+        return EndingThread(target, scheduler.current) if ending else target
 
 
 class Scheduler:
@@ -103,7 +113,7 @@ class Scheduler:
                 if task.waiting_for is not None and task.can_interrupt:
                     self.wake(task, None)
 
-    def kill(self, target):
+    def kill(self, target, *, action="kill"):
         if target.outcome is not None:
             return
         self.request_cancellation(target)
@@ -112,7 +122,18 @@ class Scheduler:
                 target.unwinding = True
                 raise Cancelled()
             return
-        yield from self.join(target, action="kill")
+        yield from self.join(target, action=action)
+
+    def invoke(self, name, target):
+        if isinstance(target, EndingThread):
+            if target.owner is not self.current:
+                raise RuntimeError("a local EndingThread belongs to its creating task")
+            target = target.target
+        if name == "share_thread":
+            return target
+        if name in {"kill", "kill_ending"}:
+            return (yield from self.kill(target, action=name))
+        return (yield from self.join(target, action=name))
 
     def finish(self, task, outcome):
         task.outcome = outcome

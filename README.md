@@ -49,6 +49,10 @@ Grant `--threads` to a program whose `main` declares a `threads` capability. Wit
 
 Use `defer cleanup(args);` to register a call on the current block. Argument expressions run at registration. Mutable arguments capture their storage. Deferred calls run in reverse order on block exit, including early return and cancellation. Cancellation lets cleanup in progress finish.
 
+Starting an `ending` task gives the creating task a `local EndingThread<T>`. Use `join_ending(child)` for its `result<T, Killed>` or `kill_ending(child)` to cancel it and wait for its own cleanup. These waits are available in an `ending` function. Recursive starts of ending tasks are rejected inside the ending call graph. An ending task can still start ordinary tasks, and killing it requests cancellation of its descendants without waiting for their cleanup.
+
+A local handle can be bound or captured by a deferred call within its creating task. An `ending` function can only defer an `ending` call. Use `share_thread(child)` to obtain a shared `Thread<T>` for ordinary joins, kills, and message passing. The language provides no conversion back to a local handle.
+
 ## Channels
 
 Grant `--channels` to a program whose `main` declares a `channels` capability. To create a channel, give `create_channel` a result type such as `Channel<int32>` through a binding annotation, return type, or `as` annotation.
