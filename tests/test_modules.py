@@ -136,6 +136,16 @@ class Modules(unittest.TestCase):
         flags = ("--console", "--filesystem", "--random")
         run = self.cli("run", source, *flags, input="1\nAda\n" + "\n" * 20 + "3\n")
         self.assertEqual(run.returncode, 0, run.stderr)
+        lines = run.stdout.splitlines()
+        frame_starts = [index for index, line in enumerate(lines) if line.startswith("┌")]
+        self.assertGreater(len(frame_starts), 1)
+        for start in frame_starts:
+            frame = lines[start:start + 40]
+            self.assertEqual([len(line) for line in frame], [80] * 40)
+            self.assertTrue(frame[-1].startswith("└"))
+            self.assertIn("COINS", frame[1])
+            self.assertIn("DISTANCE", frame[1])
+            self.assertIn("◉", "\n".join(frame))
         self.assertRegex(run.stdout, r"You crashed\. [23] coins")
         self.assertIn("Best score saved.", run.stdout)
         saved = (self.directory / "runner-scores.txt").read_text(encoding="utf-8").splitlines()

@@ -89,7 +89,9 @@ python3 -B -m prototype run examples/runner/main.proto --console --filesystem --
 python3 -B -m prototype test -r examples/runner/main.proto
 ```
 
-Choose **Play**, enter a name, and press Space to jump over barriers (`#`) and gaps while collecting coins (`o`). The course advances automatically and speeds up as the distance milestones double, up to six tiles per second. Press `q` to return to the menu early. With redirected input or an unsupported terminal, Enter advances one tile and Space followed by Enter jumps.
+Runner draws an 80-column × 40-row play screen. Use a UTF-8 terminal with at least that much space to see the full frame and its colors.
+
+Choose **Play**, enter a name, and press Space to jump over barriers (`▓`) and gaps while collecting coins (`◈`). The course advances automatically and speeds up as the distance milestones double, up to six tiles per second. Press `q` to return to the menu early. With redirected input or an unsupported terminal, Enter advances one tile and Space followed by Enter jumps.
 
 Completed runs are saved in `runner-scores.txt` in the working directory. The leaderboard keeps each player's best run, ranked by coins and then by distance. Names are case-sensitive. Use one running game per score file.
 

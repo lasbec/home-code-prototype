@@ -2,7 +2,7 @@
 enum Tile { Ground, Gap, Barrier, Coin, AirCoin }
 enum Action { Wait, Jump, Quit }
 record Segment { tiles: list<Tile>, seed: int32 }
-record Track { tiles: list<Tile>, next: Segment, offset: int32 }
+record Track { tiles: list<Tile>, next: Segment, offset: int32, behind: list<Tile> }
 
 export record Run { coins: int32, distance: int32 }
 export enum Outcome { Crash(Run), Abandoned }
@@ -50,38 +50,24 @@ pure ending fn start(seed: int32) -> State {
         Tile::Ground, Tile::Ground, Tile::Ground, Tile::Coin,
         Tile::Ground, Tile::Ground, Tile::Coin, Tile::Ground,
     ];
-    return State(track: Track(tiles: tiles, next: segment(seed), offset: 0),
+    let behind = [Tile::Ground, Tile::Ground, Tile::Ground];
+    return State(track: Track(tiles: tiles, next: segment(seed), offset: 0, behind: behind),
                  phase: 0, run: Run(coins: 0, distance: 0));
 }
 
-pure ending fn advance(track: Track) -> Track {
-    if track.offset == 7 {
-        return Track(tiles: track.next.tiles, next: segment(track.next.seed), offset: 0);
+pure ending fn currentTile(track: Track) -> Tile {
+    match at(track.tiles, track.offset) {
+        Ok(tile) { return tile; }
+        Err(outside) { return Tile::Ground; }
     }
-    return Track(tiles: track.tiles, next: track.next, offset: increment(track.offset));
 }
 
-pure ending fn tileAt(track: Track, column: int32) -> Tile {
-    match track.offset + column {
-        Ok(index) {
-            match at(track.tiles, index) {
-                Ok(tile) { return tile; }
-                Err(outside) {
-                    match subtract(left: index, right: 8) {
-                        Ok(nextIndex) {
-                            match at(track.next.tiles, nextIndex) {
-                                Ok(tile) { return tile; }
-                                Err(outOfView) {}
-                            }
-                        }
-                        Err(overflow) {}
-                    }
-                }
-            }
-        }
-        Err(overflow) {}
+pure ending fn advance(track: Track, passed: Tile) -> Track {
+    let behind = prepend(passed, dropLast(track.behind));
+    if track.offset == 7 {
+        return Track(tiles: track.next.tiles, next: segment(track.next.seed), offset: 0, behind: behind);
     }
-    return Tile::Ground;
+    return Track(tiles: track.tiles, next: track.next, offset: increment(track.offset), behind: behind);
 }
 
 pure ending fn nextPhase(phase: int32, jump: bool) -> int32 {
@@ -121,11 +107,17 @@ pure ending fn collects(tile: Tile, elevation: int32) -> bool {
     return tile == Tile::AirCoin;
 }
 
+pure ending fn visibleTile(track: Track, elevation: int32) -> Tile {
+    let tile = currentTile(track);
+    if collects(tile, elevation) { return Tile::Ground; }
+    return tile;
+}
+
 pure ending fn tick(state: State, jump: bool) -> Turn {
-    let track = advance(state.track);
+    let track = advance(state.track, passed: visibleTile(state.track, height(state.phase)));
     let phase = nextPhase(state.phase, jump);
     let elevation = height(phase);
-    let tile = tileAt(track, 0);
+    let tile = currentTile(track);
     let distance = increment(state.run.distance);
     let mut coins = state.run.coins;
     if hits(tile, elevation) { return Turn::Crash(Run(coins: coins, distance: distance)); }
@@ -183,53 +175,177 @@ fn readAction(terminal: console, delay: int32<ms>, interactive: bool) -> result<
     }
 }
 
-pure ending fn cell(tile: Tile, row: int32, player: bool) -> string {
-    if player { return " @ "; }
-    if row == -1 {
-        if tile == Tile::Gap { return "   "; }
-        return "===";
+pure ending fn paint(text: string, color: string, styled: bool) -> string {
+    if styled {
+        let start = concat(left: "\u001b[", right: concat(left: color, right: "m"));
+        return concat(left: start, right: concat(left: text, right: "\u001b[0m"));
     }
-    if row == 0 {
-        if tile == Tile::Barrier { return " # "; }
-        if tile == Tile::Coin { return " o "; }
-    }
-    if row == 1 {
-        if tile == Tile::AirCoin { return " o "; }
-    }
-    return "   ";
+    return text;
 }
 
-pure ending fn render(state: State, player: string) -> string {
-    let rows = [2, 1, 0, -1];
-    let columns = [0, 1, 2, 3, 4, 5, 6, 7, 8];
+pure ending fn runnerSprite(row: int32, floor: int32, stride: bool) -> string {
+    if row == increment(increment(floor)) { return " ◉  "; }
+    if row == increment(floor) { return "╭█╯ "; }
+    if row == floor {
+        if floor > 0 { return " ╱╲ "; }
+        if stride { return "╱ ╲ "; }
+        return " ╲╱ ";
+    }
+    return "";
+}
+
+pure ending fn cell(tile: Tile, row: int32, styled: bool) -> string {
+    if row < 0 {
+        if tile == Tile::Gap { return "    "; }
+        if row == -1 { return "▀▀▀▀"; }
+        if row == -2 { return "▓▒▓▒"; }
+        if row == -4 { return "▒░▒░"; }
+        if row == -6 { return "▒░░▒"; }
+        return "░▒░▒";
+    }
+    if tile == Tile::Barrier {
+        if row == 2 { return paint("╲▓▓╱", color: "1;91", styled); }
+        if row < 2 { return paint("▓▓▓▓", color: "91", styled); }
+    }
+    if tile == Tile::Coin {
+        if row == 1 { return paint(" ◈  ", color: "1;93", styled); }
+    }
+    if tile == Tile::AirCoin {
+        if row == 5 { return paint(" ◈  ", color: "1;93", styled); }
+    }
+    return "    ";
+}
+
+pure ending fn appendLine(screen: string, line: string) -> string {
+    return concat(left: screen, right: concat(left: "\n", right: line));
+}
+
+pure ending fn bordered(text: string) -> string {
+    return concat(left: "│", right: concat(left: text, right: "│"));
+}
+
+pure ending fn counter(value: int32) -> string {
+    let mut text = formatInt32(value);
+    let thresholds = [10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000];
+    for threshold in thresholds {
+        if value < threshold { text = concat(left: " ", right: text); }
+    }
+    return text;
+}
+
+pure ending fn dashboard(run: Run, styled: bool) -> string {
+    let coins = paint(counter(run.coins), color: "1;93", styled);
+    let distance = paint(counter(run.distance), color: "1;96", styled);
+    let title = paint("  RUNNER", color: "1;96", styled);
+    let left = concat(left: title, right: "                    COINS ");
+    let scores = concat(left: coins, right: concat(left: "        DISTANCE ", right: distance));
+    return bordered(concat(left: left, right: concat(left: scores, right: " tiles ")));
+}
+
+pure ending fn landscape(screen: string, styled: bool) -> string {
+    let scenery = [
+        "          ·                        ✦                                 ·        ",
+        "                      ·                                ╭────╮                 ",
+        "      ✦                                       ·       ╭╯░░░ ╰╮           ✧    ",
+        "                            ·                         │░░░   │                ",
+        "               ·                       ·              ╰╮░   ╭╯                ",
+        "                                 ✧                     ╰────╯                 ",
+        "       ·                                                            ·         ",
+        "                      ───────                                 ─────           ",
+        "                 ──────                                 ────────              ",
+        "                ╱ ╲             ·             ╱╱ ╲           ╱╲               ",
+        "               ╱   ╲╲       ╱╲               ╱    ╲╲       ╱╱  ╲              ",
+        "      ╲       ╱░░░░░▒╲    ╱╱░░╲            ╱╱░░░▒░░░╲    ╱╱░░░▒░╲             ",
+        "     ╱░╲╲    ╱░░░░▒░░░╲ ╱╱░░░░░╲          ╱░░░▒░░░░░░╲ ╱╱░░░▒░░░░╲       ╱╲   ",
+        "   ╱╱░░░░╲╲ ╱░░░▒░░░░░░╱░░░░░░▒░╲       ╱╱░░▒░░░░░░▒░░╱░░░▒░░░░░░▒╲    ╱╱░░╲  ",
+        "  ╱░░░░▒░░░╱░░▒░░░░░░▒░░░░░░▒░░░░╲    ╱╱░░▒░░░░░░▒░░░░░░▒░░░▄▄▄▒░░░╲ ╱╱░░░░░╲ ",
+        " ╱░░░▒░░░░░░▒░░░░░░▒░░░░░░▄▄▄░░░░▒╲ ╱╱░░▒░░░░░░▒░░░░░░▒▄▄▄▄░███░░░░░╱░░░░░░▒░╲",
+        "╱░░▒░░░▄▄▄▄░░░░░░▒░▄▄▄▄▄▒░█▪█░░▒░░▄▄▄▄▄▄░░░░░▒░░░░░░▒░░█▪██▒█▪█░░▄▄▄▄▄▄░░▒░░░░",
+        "░▄▄▄▄▄░████░▄▄░▒░░░█████░░███▒▄▄▄░██████░▄▄▒░░░░▄▄▄▄▄░░████░███░▒██████▒░░▄▄▄░",
+    ];
+    let mut frame = screen;
+    let mut row = 0;
+    for line in scenery {
+        let mut color = "2;35";
+        if row < 7 { color = "36"; }
+        frame = appendLine(frame, line: bordered(paint(line, color: color, styled)));
+        row = increment(row);
+    }
+    return frame;
+}
+
+pure ending fn upcoming(track: Track) -> list<Tile> {
+    // Keep the preview in right-to-left order for prepending tiles when drawing.
+    let mut tiles: list<Tile> = [];
+    let mut preview = track;
+    let columns = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+    for column in columns {
+        preview = advance(preview, passed: currentTile(preview));
+        tiles = prepend(currentTile(preview), tiles);
+    }
+    return tiles;
+}
+
+pure ending fn course(screen: string, state: State, styled: bool) -> string {
+    let future = upcoming(state.track);
+    let behind = state.track.behind;
     let elevation = height(state.phase);
-    let mut screen = concat(left: "Runner | ", right: player);
-    screen = concat(left: screen, right: " | Space jumps | q returns to menu\n");
-    for row in rows {
-        for column in columns {
-            let tile = tileAt(state.track, column);
-            let mut isPlayer = false;
-            if column == 0 { isPlayer = row == elevation; }
-            screen = concat(left: screen, right: cell(tile, row, player: isPlayer));
-        }
-        screen = concat(left: screen, right: "\n");
+    let tile = visibleTile(state.track, elevation);
+    let mut floor = 0;
+    if elevation == 1 { floor = 3; }
+    if elevation == 2 { floor = 6; }
+    let poses = [false, true, false, true, false, true, false, true];
+    let mut stride = false;
+    match at(poses, state.track.offset) {
+        Ok(pose) { stride = pose; }
+        Err(outside) {}
     }
-    screen = concat(left: screen, right: concat(left: "Coins: ", right: formatInt32(state.run.coins)));
-    screen = concat(left: screen, right: concat(left: " | Distance: ", right: formatInt32(state.run.distance)));
-    return concat(left: screen, right: "\n");
+    let mut frame = screen;
+    let rows = [8, 7, 6, 5, 4, 3, 2, 1, 0, -1, -2, -3, -4, -5, -6, -7];
+    for row in rows {
+        let mut line = " ";
+        for next in future {
+            line = concat(left: cell(next, row, styled), right: line);
+        }
+        let sprite = runnerSprite(row: row, floor: floor, stride);
+        let mut center = cell(tile, row, styled);
+        if sprite != "" { center = paint(sprite, color: "1;96", styled); }
+        line = concat(left: center, right: line);
+        for passed in behind {
+            line = concat(left: cell(passed, row, styled), right: line);
+        }
+        if row < 0 {
+            let mut color = "2;33";
+            if row == -1 { color = "1;32"; }
+            line = paint(line, color: color, styled);
+        }
+        frame = appendLine(frame, line: bordered(concat(left: " ", right: line)));
+    }
+    return frame;
 }
 
-fn show(terminal: console, state: State, player: string, interactive: bool) -> result<unit, HostError> {
-    let screen = render(state, player);
+pure ending fn render(state: State, styled: bool) -> string {
+    let divider = "├──────────────────────────────────────────────────────────────────────────────┤";
+    let mut screen = appendLine(screen: "┌──────────────────────────────────────────────────────────────────────────────┐", line: dashboard(state.run, styled));
+    screen = appendLine(screen, line: divider);
+    screen = landscape(screen, styled);
+    screen = course(screen, state, styled);
+    screen = appendLine(screen, line: divider);
+    screen = appendLine(screen, line: bordered("  SPACE  Jump   ·   Q  Menu   ·   ◈  Coin   ·   ▓  Barrier   ·   Gap          "));
+    return appendLine(screen, line: "└──────────────────────────────────────────────────────────────────────────────┘");
+}
+
+fn show(terminal: console, state: State, interactive: bool) -> result<unit, HostError> {
+    let screen = render(state, styled: interactive);
     if interactive {
-        let frame = concat(left: "\u001b[H", right: concat(left: screen, right: "\u001b[J"));
-        return write(terminal, frame);
+        return write(terminal, concat(left: "\u001b[H", right: screen));
     }
-    return write(terminal, screen);
+    return print(terminal, screen);
 }
 
 fn playRound(terminal: console, player: string, seed: int32, interactive: bool) -> result<Outcome, HostError> {
-    let mut instructions = "Enter advances one tile | Space + Enter jumps | q + Enter returns to menu\n";
+    let controls = " | Enter advances one tile | Space + Enter jumps | q + Enter returns to menu\n";
+    let mut instructions = concat(left: player, right: controls);
     if interactive { instructions = "\u001b[2J"; }
     match write(terminal, instructions) {
         Ok(written) {}
@@ -237,7 +353,7 @@ fn playRound(terminal: console, player: string, seed: int32, interactive: bool) 
     }
     let mut state = start(seed);
     loop {
-        match show(terminal, state, player, interactive) {
+        match show(terminal, state, interactive) {
             Ok(written) {}
             Err(error) { return Err(error); }
         }
@@ -259,7 +375,15 @@ export fn play(terminal: console, player: string, seed: int32) -> result<Outcome
         Ok(interactive) {
             let outcome = playRound(terminal, player, seed, interactive);
             match disableKeyInput(terminal) {
-                Ok(restored) { return outcome; }
+                Ok(restored) {
+                    if interactive {
+                        match write(terminal, "\n") {
+                            Ok(written) {}
+                            Err(error) { return Err(error); }
+                        }
+                    }
+                    return outcome;
+                }
                 Err(error) { return Err(error); }
             }
         }
