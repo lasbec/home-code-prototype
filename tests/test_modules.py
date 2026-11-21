@@ -82,6 +82,24 @@ class Modules(unittest.TestCase):
         self.source("main.proto", "export let mut counter = 0;")
         self.assertIn("expected 'fn', found 'let'", self.cli("check", "main.proto").stderr)
 
+    def test_mutation_through_an_imported_function(self):
+        self.source("library.proto", "export fn set(value: mut int32) -> unit { value = 2; }")
+        self.source("main.proto", """
+            import "./library.proto"
+            fn main() -> int32 {
+                let mut value = 1;
+                library.set(mut value);
+                return value;
+            }
+        """)
+        run = self.cli("run", "main.proto")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout, "2\n")
+        self.source("library.proto", "export fn set(value: mut int32) -> unit {}")
+        error = self.cli("check", "main.proto").stderr
+        self.assertIn("library.proto:", error)
+        self.assertIn("mut parameter 'value' is never written", error)
+
     def test_types_with_the_same_name_remain_distinct(self):
         for name in ("first", "second"):
             self.source(f"{name}.proto", "export record Score { value: int32 }")

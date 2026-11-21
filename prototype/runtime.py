@@ -345,11 +345,11 @@ class Interpreter:
         for node in statements:
             kind, fields = node.kind, node.fields
             if kind == "let":
-                name, expression = fields
-                environment[name] = Cell(self.expression(expression, environment))
+                binding, expression, _ = fields
+                environment[binding.text] = Cell(self.expression(expression, environment))
             elif kind == "assign":
-                name, expression = fields
-                environment[name].value = self.expression(expression, environment)
+                binding, expression = fields
+                environment[binding.text].value = self.expression(expression, environment)
             elif kind == "return":
                 return True, self.expression(fields[0], environment)
             elif kind == "expression":
@@ -424,8 +424,8 @@ class Interpreter:
 
     def arguments(self, plan, environment):
         arguments = [None] * len(plan)
-        for slot, mutable, expression in plan:
-            arguments[slot] = environment[expression] if mutable else self.expression(expression, environment)
+        for slot, mutable, value in plan:
+            arguments[slot] = environment[value.text] if mutable else self.expression(value, environment)
         return arguments
 
 

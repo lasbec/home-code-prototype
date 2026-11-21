@@ -1,5 +1,6 @@
 """Static checking and lowering to an interpreter-ready program."""
 
+from collections import defaultdict
 from dataclasses import dataclass, field, replace
 
 from .syntax import (
@@ -58,6 +59,7 @@ EXAMPLE_VALUE_KINDS = {"value", "integer", "decimal", "list", "variant", "call"}
 
 @dataclass(frozen=True)
 class Binding:
+    token: Token
     type: Type
     mutable: bool
     parameter: bool = False
@@ -96,7 +98,7 @@ class Flow:
         name = token.text
         if name in self.bindings:
             raise LanguageError(token, f"data variable '{name}' is already defined in this scope")
-        self.bindings[name] = Binding(value_type, mutable, parameter)
+        self.bindings[name] = Binding(token, value_type, mutable, parameter)
 
     def require(self, token, name):
         if name not in self.bindings:
@@ -259,7 +261,49 @@ class Checker:
             examples = tuple(self.check_example(function, example) for example in function.examples)
             checked[function.key] = replace(function, body=body, examples=examples)
         self.check_termination(checked)
+        self.check_mutations(checked)
         return checked
+
+    def check_mutations(self, checked):
+        parameters = {
+            (function.key, slot): parameter.token
+            for function in checked.values()
+            for slot, parameter in enumerate(function.parameters)
+            if parameter.mutable
+        }
+        declarations = {}
+        written = set()
+        callers = defaultdict(set)
+        for function in checked.values():
+            for parameter in function.parameters:
+                if parameter.mutable:
+                    declarations[parameter.token] = "parameter"
+            for node in walk(function.body):
+                if node.kind == "let" and node.fields[2]:
+                    declarations[node.fields[0]] = "variable"
+                elif node.kind == "assign":
+                    written.add(node.fields[0])
+                elif node.kind == "invoke":
+                    callee, plan, _ = node.fields
+                    for slot, mutable, binding in plan:
+                        if not mutable:
+                            continue
+                        if callee in checked:
+                            callers[parameters[callee, slot]].add(binding)
+                        else:
+                            # Imported functions have already passed this check.
+                            written.add(binding)
+
+        # Propagate writes backwards through resolved calls. Forwarding cycles
+        # only qualify when a write can reach them.
+        pending = list(written)
+        while pending:
+            for binding in callers[pending.pop()] - written:
+                written.add(binding)
+                pending.append(binding)
+        for token, kind in declarations.items():
+            if token not in written:
+                raise LanguageError(token, f"mut {kind} '{token.text}' is never written")
 
     def check_example(self, function, example):
         parameters = {parameter.name: parameter for parameter in function.parameters}
@@ -349,14 +393,15 @@ class Checker:
             if "ending" in function.modifiers:
                 visit(function)
 
-    def block(self, statements, flow):
+    def block(self, statements, flow, *, reachable=True):
         checked = []
-        returns = False
+        ends = not reachable
         for statement in statements:
+            if ends:
+                raise LanguageError(statement.token, "unreachable statement")
             lowered, ends = self.statement(statement, flow)
             checked.append(lowered)
-            returns = returns or ends
-        return tuple(checked), returns
+        return tuple(checked), ends
 
     def statement(self, node, flow):
         kind, fields = node.kind, node.fields
@@ -366,7 +411,7 @@ class Checker:
             flow.define(name, declared or value.type.without_refinement(), mutable)
             if value.type.nonzero:
                 flow.nonzero.add(name.text)
-            lowered = (name.text, value.node)
+            lowered = (name, value.node, mutable)
         elif kind == "assign":
             name, expression = fields
             binding = self.writable(flow, name, name.text)
@@ -374,7 +419,7 @@ class Checker:
             flow.drop_proof(name.text)
             if value.type.nonzero:
                 flow.nonzero.add(name.text)
-            lowered = (name.text, value.node)
+            lowered = (binding.token, value.node)
         elif kind == "return":
             value = self.expression(fields[0], flow, self.current_function.output)
             return Node(node.token, kind, (value.node,)), True
@@ -385,8 +430,9 @@ class Checker:
             value = self.expression(condition, flow, BOOL)
             yes_flow, no_flow = flow.copy(), flow.copy()
             self.narrow(condition, yes_flow, no_flow)
-            yes_body, yes_returns = self.block(yes, yes_flow)
-            no_body, no_returns = self.block(no, no_flow)
+            constant = condition.fields[0] if condition.kind == "value" else None
+            yes_body, yes_returns = self.block(yes, yes_flow, reachable=constant is not False)
+            no_body, no_returns = self.block(no, no_flow, reachable=constant is not True)
             merge_proofs(flow, ((yes_flow, yes_returns), (no_flow, no_returns)))
             return Node(node.token, kind, (value.node, yes_body, no_body)), yes_returns and no_returns
         elif kind == "match":
@@ -820,15 +866,17 @@ class Checker:
         if (binding.type.without_refinement() != parameter.type.without_refinement()
                 or (binding.type.nonzero and not parameter.type.nonzero)):
             raise LanguageError(argument.token, f"cannot pass mut {binding.type} to mut {parameter.type}")
-        return name
+        return binding.token
 
     def finish_mutable_arguments(self, flow, arguments):
-        for index, (argument, parameter, name) in enumerate(arguments):
+        for index, (argument, parameter, binding) in enumerate(arguments):
+            name = binding.text
             if not compatible(flow.type_of(name), parameter.type):
                 raise LanguageError(argument.token, f"'{name}' needs a nonzero proof for mut {parameter.type}")
-            for _, other, alias in arguments[:index]:
+            for _, other, previous in arguments[:index]:
+                alias = previous.text
                 if parameter.type.nonzero != other.type.nonzero and flow.may_alias(name, alias):
                     raise LanguageError(argument.token, f"'{name}' and '{alias}' may alias with different refinements")
-        for _, parameter, name in arguments:
+        for _, parameter, binding in arguments:
             if not parameter.type.nonzero:
-                flow.drop_proof(name)
+                flow.drop_proof(binding.text)

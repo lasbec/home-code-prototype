@@ -44,6 +44,7 @@ class FunctionExamples(unittest.TestCase):
             deterministic ending fn configure(state: mut ReadingState, backup: mut ReadingState)
                     -> result<ReadingState, Zero> {
                 state = ReadingState::Ready(Reading(distance: -0.5, labels: []));
+                backup = backup;
                 return Ok(backup);
             }
 
@@ -102,7 +103,7 @@ class FunctionExamples(unittest.TestCase):
         self.assertEqual(empty.stdout.strip(), "0 passed, 0 failed (0 total)")
 
     def test_rejects_invalid_example_entries(self):
-        signature = "deterministic ending fn f(n: mut int32!0, read: int32) -> unit {}"
+        signature = "deterministic ending fn f(n: mut int32!0, read: int32) -> unit { n = n; }"
         for entries, error in (
             ("input read: 1; expect unit;", "missing an 'input' entry for 'n'"),
             ("input n: 1; input read: 1; expect unit;", "missing an 'after' entry for 'n'"),

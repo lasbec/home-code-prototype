@@ -1,4 +1,5 @@
 fn update(refined: mut int32!0, unrestricted: mut int32) -> unit {
+    refined = 1;
     unrestricted = 0;
 }
 
