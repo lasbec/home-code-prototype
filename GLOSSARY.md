@@ -33,3 +33,25 @@ A restriction on a numeric type that excludes zero, written `!0` in a type such 
 **Unit-bearing number**
 
 A number whose type includes a unit dimension, such as `meter` in `int32<meter>`.
+
+## Concurrency
+
+**Ownership parameter (`own`)**
+
+A parameter that takes ownership of its argument. The caller loses access through the argument binding.
+
+**Shared value (`shared`)**
+
+A handle or Host Capability that multiple threads may keep and use. Passing it leaves existing bindings valid.
+
+**Local value (`local`)**
+
+A value confined to the thread that created it. The restriction also applies through a containing value.
+
+**Thread start (`thread`)**
+
+An expression that starts a named function in a green thread and returns a handle to that thread.
+
+**Deferred call (`defer`)**
+
+A call registered in a block to run when that block exits, including on cancellation.
