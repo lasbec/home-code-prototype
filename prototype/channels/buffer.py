@@ -20,7 +20,7 @@ class Channel:
         if self.receivers:
             receiver = next(iter(self.receivers))
             del self.receivers[receiver]
-            scheduler.wake(receiver, message)
+            scheduler.wake(receiver, Result("Ok", message))
         elif self.capacity is None or len(self.messages) < self.capacity:
             self.messages.append(message)
         else:
@@ -32,30 +32,43 @@ class Channel:
         if self.senders:
             sender = next(iter(self.senders))
             self.messages.append(self.senders.pop(sender))
-            scheduler.wake(sender, None)
+            scheduler.wake(sender, Result("Ok", None))
         return message
 
-    def send(self, scheduler, message, *, blocking):
-        if not self.offer(scheduler, message):
-            if not blocking:
-                return Result("Err", Variant("TrySendError", "Full", message, has_payload=True))
-            task = scheduler.current
-            self.senders[task] = message
-            scheduler.park(f"send on {self}")
-            yield
-        return Result("Ok", None)
-
-    def receive(self, scheduler, *, blocking):
-        if self.messages:
-            message = self.take(scheduler)
-        elif blocking:
-            task = scheduler.current
-            self.receivers[task] = None
-            scheduler.park(f"receive on {self}")
-            message = yield
+    def send(self, scheduler, message, timeout=None, *, blocking):
+        scheduler.expire_timers()
+        if self.offer(scheduler, message):
+            return Result("Ok", None)
+        if timeout is None:
+            failure = Result("Err", Variant("TrySendError", "Full", message, has_payload=True))
         else:
-            return Result("Err", Variant("Empty", "Empty"))
-        return message if blocking else Result("Ok", message)
+            failure = Result("Err", Variant("SendTimeout", "Timeout", message, has_payload=True))
+        if not (blocking or timeout):
+            return failure
+        task = scheduler.current
+        self.senders[task] = message
+        self.park(scheduler, "send", self.senders, timeout, failure)
+        return (yield)
+
+    def receive(self, scheduler, timeout=None, *, blocking):
+        scheduler.expire_timers()
+        if self.messages:
+            result = Result("Ok", self.take(scheduler))
+        else:
+            code = "Empty" if timeout is None else "Timeout"
+            failure = Result("Err", Variant(code, code))
+            if not (blocking or timeout):
+                return failure
+            self.receivers[scheduler.current] = None
+            self.park(scheduler, "receive", self.receivers, timeout, failure)
+            result = yield
+        return result.value if blocking else result
+
+    def park(self, scheduler, operation, waiters, timeout, failure):
+        task = scheduler.current
+        deadline = None if timeout is None else scheduler.clock() + timeout / 1000
+        scheduler.park(f"{operation} on {self}", remove=lambda: waiters.pop(task, None),
+                       deadline=deadline, timeout_value=failure)
 
 
 class Channels:
@@ -69,6 +82,6 @@ def invoke(name, arguments, scheduler):
         return channels.create(capacity)
     channel, *payload = arguments
     blocking = name.endswith("_blocking")
-    if name in {"try_send", "send_blocking"}:
+    if "send" in name:
         return (yield from channel.send(scheduler, *payload, blocking=blocking))
-    return (yield from channel.receive(scheduler, blocking=blocking))
+    return (yield from channel.receive(scheduler, *payload, blocking=blocking))

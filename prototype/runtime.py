@@ -307,11 +307,13 @@ OPERATORS = {"==": eq, "!=": ne, "<": lt, ">": gt, "<=": le, ">=": ge, "/": true
 
 
 class Interpreter:
-    def __init__(self, functions):
+    def __init__(self, functions, *, clock=None, idle=None):
         self.functions = functions
+        self.clock = clock
+        self.idle = idle
 
     def call(self, name, arguments):
-        scheduler = Scheduler()
+        scheduler = Scheduler(clock=self.clock, idle=self.idle)
         return scheduler.run(self.invoke(name, arguments, scheduler))
 
     def invoke(self, name, arguments, scheduler):
@@ -403,7 +405,7 @@ class Interpreter:
         raise AssertionError(kind)
 
     def expression(self, node, environment):
-        scheduler = Scheduler()
+        scheduler = Scheduler(clock=self.clock, idle=self.idle)
         return scheduler.run(self.evaluate(node, environment, scheduler))
 
     def evaluate(self, node, environment, scheduler):

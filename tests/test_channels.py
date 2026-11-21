@@ -2,11 +2,11 @@
 
 import unittest
 
-from prototype.channels.buffer import Channels
+from prototype.channels.buffer import Channel, Channels
 from prototype.checker import Checker
 from prototype.runtime import Interpreter, display
 from prototype.syntax import LanguageError, Parser
-from prototype.threads.scheduler import Threads
+from prototype.threads.scheduler import Scheduler, Threads
 
 
 def compile_program(source):
@@ -152,3 +152,81 @@ class ChannelsTest(unittest.TestCase):
                     send_blocking(full, 2);
                 }
             """, Threads())
+
+    def test_timed_wait_can_wake_the_only_task(self):
+        clock = ControlledClock()
+        program = compile_program("""
+            fn main(channels: channels) -> result<int32, Timeout> {
+                let q: Channel<int32> = create_channel(channels, Capacity::Bounded(1));
+                return receive_timeout(q, 25);
+            }
+        """)
+        interpreter = Interpreter(program, clock=clock.now, idle=clock.advance)
+        self.assertEqual(display(interpreter.call("main", (Channels(),))), "Err(Timeout::Timeout)")
+        self.assertEqual(clock.now(), 0.025)
+
+    def test_zero_timeout_attempt_and_units(self):
+        self.assertEqual(self.run_main("""
+            fn main(channels: channels) -> result<int32, Timeout> {
+                let q: Channel<int32> = create_channel(channels, Capacity::Bounded(1));
+                send_timeout(q, message: 3, timeout: 0);
+                return receive_timeout(q, 0);
+            }
+        """), "Ok(3)")
+        with self.assertRaisesRegex(LanguageError, "expected uint32<ms>"):
+            compile_program("""
+                fn receive(q: Channel<int32>, wait: uint32) -> result<int32, Timeout> {
+                    return receive_timeout(q, wait);
+                }
+            """)
+
+    def test_transfer_before_deadline_and_expiry_at_deadline(self):
+        for elapsed, outcome, next_value in (
+            (0.009, "Ok(unit)", "Ok(2)"),
+            (0.010, "Err(SendTimeout::Timeout(2))", "Err(Empty::Empty)"),
+            (0.011, "Err(SendTimeout::Timeout(2))", "Err(Empty::Empty)"),
+        ):
+            with self.subTest(elapsed=elapsed):
+                clock = ControlledClock()
+                scheduler = Scheduler(clock=clock.now, idle=clock.advance)
+                q = Channel(1)
+
+                def exercise():
+                    yield from q.send(scheduler, 1, blocking=False)
+                    sender = scheduler.start(q.send(scheduler, 2, 10, blocking=False))
+                    yield
+                    clock.advance(elapsed)
+                    self.assertEqual((yield from q.receive(scheduler, blocking=True)), 1)
+                    finished = yield from scheduler.join(sender)
+                    return display(finished.value), display((yield from q.receive(scheduler, blocking=False)))
+
+                self.assertEqual(scheduler.run(exercise()), (outcome, next_value))
+                self.assertEqual(q.senders, {})
+                self.assertIsNone(scheduler.timers.next_deadline())
+
+    def test_expired_receiver_cannot_take_later_message(self):
+        clock = ControlledClock()
+        scheduler = Scheduler(clock=clock.now, idle=clock.advance)
+        q = Channel(1)
+
+        def exercise():
+            receiver = scheduler.start(q.receive(scheduler, 10, blocking=False))
+            yield
+            clock.advance(0.010)
+            yield from q.send(scheduler, 5, blocking=True)
+            result = yield from scheduler.join(receiver)
+            return display(result.value), (yield from q.receive(scheduler, blocking=True))
+
+        self.assertEqual(scheduler.run(exercise()), ("Err(Timeout::Timeout)", 5))
+        self.assertEqual(q.receivers, {})
+
+
+class ControlledClock:
+    def __init__(self):
+        self.time = 0.0
+
+    def now(self):
+        return self.time
+
+    def advance(self, duration):
+        self.time += duration

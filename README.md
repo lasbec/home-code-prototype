@@ -59,6 +59,8 @@ let result = try_receive(queue);
 
 `send_blocking` waits for room and returns `result<unit, Never>`. `receive_blocking` waits for a message and returns `T`. A wait parks only the calling thread. When space or a message becomes available, the oldest eligible waiter gets it before later operations.
 
+`send_timeout(channel, message, timeout)` and `receive_timeout(channel, timeout)` take a `uint32<ms>` duration. A zero duration makes one immediate attempt. If the deadline arrives first, the operation returns `Timeout` and leaves the wait queue. A send returns the original message in its `SendTimeout<T>::Timeout` error. Deadlines at the current clock time are processed before another transfer.
+
 ## Mock host environments
 
 A mock is a self-contained `.proto` file that starts with `mock console`, `mock filesystem`, or `mock random`. Export every function for that environment in the host function table and keep other declarations private. Each export replaces the host capability parameter with `state: mut T`, where `T` is the same type across all exports. The remaining parameters, result type, and commutative group match the host signature. The mock can use host-independent built-ins and construct `HostError(kind: HostErrorKind::Other, message: "details")`.
