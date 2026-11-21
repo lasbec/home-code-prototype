@@ -24,11 +24,7 @@ class Mutation(unittest.TestCase):
             ("""fn update(value: mut int32) -> unit { value = 2; }
                 fn main() -> unit { let value = 1; update(mut value); }""",
              "'value' needs a mut declaration"),
-            ("""fn update(first: mut int32, second: mut int32) -> unit { first = first; }
-                fn main() -> unit {
-                    let mut value = 1;
-                    update(first: mut value, second: mut value);
-                }""",
+            ("""fn update(first: mut int32, second: mut int32) -> unit { first = first; }""",
              "mut parameter 'second' is never written"),
             ("""fn choose(flag: bool) -> unit {
                     if flag { let mut value = 0; value = 1; }

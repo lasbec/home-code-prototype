@@ -64,7 +64,7 @@ class Binding:
     token: Token
     type: Type
     mutable: bool
-    parameter: bool = False
+    borrowed: bool = False
 
 
 @dataclass
@@ -73,39 +73,51 @@ class Flow:
     nonzero: set = field(default_factory=set)
     protected: frozenset = frozenset()
     literal_context: str | None = None
+    moved: set = field(default_factory=set)
+    loans: frozenset = frozenset()
+    write_loans: frozenset = frozenset()
 
     def copy(self):
-        return Flow(self.bindings.copy(), self.nonzero.copy(), self.protected, self.literal_context)
+        return replace(self, bindings=self.bindings.copy(), nonzero=self.nonzero.copy(),
+                       moved=self.moved.copy())
 
     def type_of(self, name):
         declared = self.bindings[name].type
         return declared.refined() if name in self.nonzero else declared
 
-    def may_alias(self, left, right):
-        if left == right:
-            return True
-        first, second = self.bindings[left], self.bindings[right]
-        return (first.mutable and second.mutable and first.parameter and second.parameter
-                and first.type == second.type)
-
     def ensure_unprotected(self, token, name):
-        for source in self.protected:
-            if self.may_alias(source, name):
-                raise LanguageError(token, f"loop source '{source}' is read-only in the loop body")
+        if name in self.protected:
+            raise LanguageError(token, f"loop source '{name}' is read-only in the loop body")
+        if name in self.loans:
+            raise LanguageError(token, f"'{name}' is already borrowed by this call")
 
     def drop_proof(self, name):
-        self.nonzero = {other for other in self.nonzero if not self.may_alias(name, other)}
+        self.nonzero.discard(name)
 
-    def define(self, token, value_type, mutable=False, parameter=False):
+    def define(self, token, value_type, mutable=False, borrowed=False):
         name = token.text
         if name in self.bindings:
             raise LanguageError(token, f"data variable '{name}' is already defined in this scope")
-        self.bindings[name] = Binding(token, value_type, mutable, parameter)
+        self.bindings[name] = Binding(token, value_type, mutable, borrowed)
 
-    def require(self, token, name):
+    def require(self, token, name, *, read=True):
         if name not in self.bindings:
             raise LanguageError(token, f"unknown data variable '{name}'")
+        if read and name in self.moved:
+            raise LanguageError(token, f"'{name}' was moved and needs reassignment")
         return self.bindings[name]
+
+    def move(self, token, name):
+        binding = self.require(token, name)
+        self.ensure_unprotected(token, name)
+        if binding.borrowed:
+            raise LanguageError(token, f"cannot move borrowed value '{name}'")
+        self.moved.add(name)
+        self.drop_proof(name)
+
+    def commit(self, trial):
+        self.nonzero = trial.nonzero
+        self.moved = trial.moved
 
 
 @dataclass(frozen=True)
@@ -145,10 +157,17 @@ def walk(value):
             yield from walk(item)
 
 
-def merge_proofs(flow, branches):
-    continuing = [branch.nonzero for branch, returns in branches if not returns]
+def merge_flow(flow, branches):
+    continuing = [branch for branch, returns in branches if not returns]
     if continuing:
-        flow.nonzero = set.intersection(*continuing) & flow.bindings.keys()
+        flow.nonzero = set.intersection(*(branch.nonzero for branch in continuing)) & flow.bindings.keys()
+        flow.moved = set.union(*(branch.moved for branch in continuing)) & flow.bindings.keys()
+
+
+def source_binding(node):
+    while node.kind in {"field", "as"}:
+        node = node.fields[0]
+    return node.fields[0] if node.kind == "variable" else None
 
 
 class Checker:
@@ -243,9 +262,9 @@ class Checker:
             if function is None:
                 raise LanguageError(self.mock_header, f"{self.mock_header.text} mock is missing export '{name}'")
             parameters = function.parameters
-            signature = tuple((p.name, p.type, p.mutable) for p in parameters[1:])
+            signature = tuple((p.name, p.type, p.mutable, p.owning) for p in parameters[1:])
             if (not parameters or parameters[0].name != "state" or not parameters[0].mutable
-                    or signature != tuple((p.name, p.type, p.mutable) for p in host.parameters[1:])
+                    or signature != tuple((p.name, p.type, p.mutable, p.owning) for p in host.parameters[1:])
                     or function.output != host.output
                     or function.commutative_slots != host.commutative_slots):
                 remaining = [f"{p.name}: {p.type}" for p in host.parameters[1:]]
@@ -269,6 +288,19 @@ class Checker:
         for argument in value_type.arguments:
             self.check_public_type(argument, token)
 
+    def contains_exclusive(self, value_type, seen=frozenset()):
+        if value_type in seen:
+            return False
+        if value_type.name in CAPABILITIES and value_type.module is None:
+            return not value_type.shared
+        if value_type in self.records:
+            members = (field.type for field in self.records[value_type].parameters)
+        elif value_type in self.enums:
+            members = (payload for payload in self.enums[value_type].values() if payload is not None)
+        else:
+            members = value_type.arguments
+        return any(self.contains_exclusive(member, seen | {value_type}) for member in members)
+
     def check_signature(self, function, entry):
         if function.examples and not {"deterministic", "ending"} <= function.modifiers:
             raise LanguageError(function.examples[0].token,
@@ -283,23 +315,29 @@ class Checker:
                     raise LanguageError(function.token, "commutative must name two or more distinct parameters")
             elif len(slots) != 2:
                 raise LanguageError(function.token, "commutative must name its parameters on functions with arity other than two")
-            if any(parameter.mutable for parameter in group) or len({parameter.type for parameter in group}) != 1:
+            if any(parameter.mutable or parameter.owning for parameter in group) or len({parameter.type for parameter in group}) != 1:
                 raise LanguageError(function.token, "commutative parameters must be read-only and have the same type")
         if entry and function.name == "main":
-            capabilities = [parameter.type for parameter in function.parameters]
+            capabilities = [replace(parameter.type, shared=False) for parameter in function.parameters]
             if (any(parameter.mutable for parameter in function.parameters)
-                    or not set(capabilities) <= {CONSOLE, FILESYSTEM, RANDOM}
+                    or not set(capabilities) <= set(CAPABILITIES.values())
                     or len(capabilities) != len(set(capabilities))):
                 raise LanguageError(function.token,
-                                    "main may accept one of each read-only capability: console, filesystem, random")
+                                    "main may accept one parameter for each host capability")
 
     def program(self):
         checked = {}
         for function in self.functions.values():
             self.current_function = function
+            for parameter in function.parameters:
+                if parameter.owning and parameter.type.shared:
+                    raise LanguageError(parameter.token, "own cannot consume a shared value")
             flow = Flow()
             for parameter in function.parameters:
-                flow.define(parameter.token, parameter.type, parameter.mutable, parameter=True)
+                borrowed = parameter.mutable or (
+                    not parameter.owning and self.contains_exclusive(parameter.type)
+                )
+                flow.define(parameter.token, parameter.type, parameter.mutable, borrowed)
             body, returns = self.block(function.body, flow)
             if not returns and function.output != UNIT:
                 raise LanguageError(function.token, f"some paths do not return {function.output}")
@@ -471,7 +509,7 @@ class Checker:
         facts = []
         if kind == "let":
             name, declared, mutable, expression = fields
-            value = self.expression(expression, flow, declared)
+            value = self.expression(expression, flow, declared, transfer=True)
             flow.define(name, declared or value.type.without_refinement(), mutable)
             if value.type.nonzero:
                 flow.nonzero.add(name.text)
@@ -479,15 +517,16 @@ class Checker:
             facts.append((name, "local_type", flow.bindings[name.text].type))
         elif kind == "assign":
             name, expression = fields
-            binding = self.writable(flow, name, name.text)
-            value = self.expression(expression, flow, binding.type)
+            binding = self.writable(flow, name, name.text, read=False)
+            value = self.expression(expression, flow, binding.type, transfer=True)
+            flow.moved.discard(name.text)
             flow.drop_proof(name.text)
             if value.type.nonzero:
                 flow.nonzero.add(name.text)
             lowered = (binding.token, value.node)
             facts.append((name, "local_reference", binding.token))
         elif kind == "return":
-            value = self.expression(fields[0], flow, self.current_function.output)
+            value = self.expression(fields[0], flow, self.current_function.output, transfer=True)
             return Node(node.token, kind, (value.node,)), True
         elif kind == "expression":
             lowered = (self.expression(fields[0], flow).node,)
@@ -499,7 +538,7 @@ class Checker:
             constant = condition.fields[0] if condition.kind == "value" else None
             yes_body, yes_returns = self.block(yes, yes_flow, reachable=constant is not False)
             no_body, no_returns = self.block(no, no_flow, reachable=constant is not True)
-            merge_proofs(flow, ((yes_flow, yes_returns), (no_flow, no_returns)))
+            merge_flow(flow, ((yes_flow, yes_returns), (no_flow, no_returns)))
             return Node(node.token, kind, (value.node, yes_body, no_body)), yes_returns and no_returns
         elif kind == "match":
             return self.match_statement(node, flow)
@@ -510,9 +549,12 @@ class Checker:
                 raise LanguageError(source, "for requires a list variable")
             loop = flow.copy()
             loop.protected |= {source.text}
-            loop.define(item, binding.type.arguments[0])
+            element = binding.type.arguments[0]
+            loop.define(item, element, borrowed=self.contains_exclusive(element))
             lowered_body = self.loop_body(body, loop)
-            flow.nonzero = loop.nonzero
+            flow.commit(loop)
+            flow.nonzero &= flow.bindings.keys()
+            flow.moved &= flow.bindings.keys()
             lowered = (item.text, Node(source, "variable", (source.text,)), lowered_body)
             facts.extend(((item, "local_type", loop.bindings[item.text].type),
                           (source, "local_reference", binding.token)))
@@ -533,13 +575,22 @@ class Checker:
         while True:
             iteration = flow.copy()
             lowered, ends = self.block(body, iteration)
-            if ends or flow.nonzero <= iteration.nonzero:
+            if ends:
                 return lowered
-            flow.nonzero &= iteration.nonzero
+            available_proofs = flow.nonzero & iteration.nonzero
+            possible_moves = flow.moved | (iteration.moved & flow.bindings.keys())
+            if available_proofs == flow.nonzero and possible_moves == flow.moved:
+                return lowered
+            flow.nonzero = available_proofs
+            flow.moved = possible_moves
 
     def match_statement(self, node, flow):
         subject, arms = node.fields
         value = self.expression(subject, flow)
+        source = source_binding(subject)
+        borrowed = source is not None and flow.bindings[source].borrowed
+        if self.contains_exclusive(value.type) and source is not None and not borrowed:
+            flow.move(subject.token, source)
         variants = self.enums.get(value.type)
         if value.type.name == "result":
             variants = dict(zip(("Ok", "Err"), value.type.arguments))
@@ -558,14 +609,14 @@ class Checker:
                 raise LanguageError(tag, f"'{tag.text}' {requirement} a payload binding")
             branch = flow.copy()
             if binding is not None:
-                branch.define(binding, payload)
+                branch.define(binding, payload, borrowed=borrowed and self.contains_exclusive(payload))
             lowered_body, ends = self.block(body, branch)
             branches.append((branch, ends))
             lowered[tag.text] = (binding.text if binding is not None else None, lowered_body)
         missing = variants.keys() - lowered.keys()
         if missing:
             raise LanguageError(node.token, f"match is missing arm(s): {', '.join(sorted(missing))}")
-        merge_proofs(flow, branches)
+        merge_flow(flow, branches)
         result = Node(node.token, node.kind, (value.node, lowered))
         for tag, binding, _ in arms:
             self.remember(result, tag, "case_reference", (value.type, tag.text))
@@ -585,17 +636,26 @@ class Checker:
             target = yes if condition.token.text == "!=" else no
             target.nonzero.add(variable.fields[0])
 
-    def writable(self, flow, token, name):
-        binding = flow.require(token, name)
+    def writable(self, flow, token, name, *, read=True):
+        binding = flow.require(token, name, read=read)
         if not binding.mutable:
             raise LanguageError(token, f"'{name}' needs a mut declaration")
         flow.ensure_unprotected(token, name)
         return binding
 
-    def expression(self, node, flow, expected=None):
+    def expression(self, node, flow, expected=None, *, transfer=False, consume=False,
+                   borrow_shared=False):
         checked = self.infer(node, flow, expected)
-        if not compatible(checked.type, expected):
+        actual = checked.type
+        shared_borrow = borrow_shared and actual.shared and replace(actual, shared=False) == expected
+        if consume and actual.shared:
+            raise LanguageError(node.token, "own cannot consume a shared value")
+        if not compatible(actual, expected) and not shared_borrow:
             raise LanguageError(node.token, f"expected {expected}, found {checked.type}")
+        if consume or (transfer and self.contains_exclusive(actual)):
+            source = source_binding(node)
+            if source is not None:
+                flow.move(node.token, source)
         self.remember(checked.node, node.token, "expression_type", checked.type)
         if checked.call is not None:
             _, bindings = checked.call
@@ -662,7 +722,7 @@ class Checker:
             if (expression is None) != (payload is None):
                 requirement = "cannot have" if payload is None else "needs"
                 raise LanguageError(node.token, f"'{name}::{tag}' {requirement} a payload")
-            value = None if expression is None else self.expression(expression, flow, payload).node
+            value = None if expression is None else self.expression(expression, flow, payload, transfer=True).node
             lowered = Node(node.token, kind, (value_type.name, tag, value))
             self.remember(lowered, node.token, "case_reference", (value_type, tag))
             return Checked(value_type, lowered)
@@ -690,7 +750,7 @@ class Checker:
                     raise LanguageError(node.token, "an empty list needs an explicit list type")
                 element = INT
             element = element.without_refinement()
-        values = [self.expression(item, flow, element).node for item in node.fields]
+        values = [self.expression(item, flow, element, transfer=True).node for item in node.fields]
         return Checked(Type("list", (element,)), Node(node.token, "list", tuple(values)))
 
     def type_hint(self, nodes, flow, type_name=None):
@@ -795,7 +855,8 @@ class Checker:
                 raise LanguageError(node.token, f"{name} takes one unnamed data value")
             if expected is None or expected.name != "result":
                 raise LanguageError(node.token, f"{name} needs an explicit result type")
-            value = self.expression(arguments[0].expression, flow, expected.arguments[name == "Err"])
+            value = self.expression(arguments[0].expression, flow, expected.arguments[name == "Err"],
+                                    transfer=True)
             call = (name, (("value", False, None),)) if self.facts is not None else None
             return Checked(expected, Node(node.token, "result", (name, value.node)), call)
         if name in self.record_names:
@@ -849,7 +910,7 @@ class Checker:
         signature = self.records[self.record_names[name]]
         if any(argument.label is None for argument in node.fields):
             raise LanguageError(node.token, f"'{name}' requires named fields")
-        value = self.bind_arguments(node, name, signature, flow)
+        value = self.bind_arguments(node, name, signature, flow, transfer=True)
         _, plan, _ = value.node.fields
         fields = tuple(parameter.name for parameter in signature.parameters)
         return Checked(signature.output, Node(node.token, "record", (signature.output.name, fields, plan)),
@@ -875,7 +936,7 @@ class Checker:
                                 items, GUARANTEES)
             trial = flow.copy()
             try:
-                value = self.bind_arguments(node, "prepend", signature, trial)
+                value = self.bind_arguments(node, "prepend", signature, trial, transfer=True)
             except LanguageError as error:
                 if str(error).startswith("ambiguous call"):
                     raise
@@ -887,10 +948,10 @@ class Checker:
         if len(solutions) > 1:
             raise LanguageError(node.token, "prepend has multiple possible list types; add an explicit type")
         value, trial = solutions[0]
-        flow.nonzero = trial.nonzero
+        flow.commit(trial)
         return value
 
-    def bind_arguments(self, node, name, signature, flow):
+    def bind_arguments(self, node, name, signature, flow, *, transfer=False):
         arguments, parameters = node.fields, signature.parameters
         if len(arguments) != len(parameters):
             raise LanguageError(node.token, f"'{name}' expects {len(parameters)} arguments, got {len(arguments)}")
@@ -933,7 +994,8 @@ class Checker:
                 parameter = parameters[index]
                 candidate = trial.copy()
                 try:
-                    value = self.check_argument(argument, parameter, candidate)
+                    value = self.check_argument(argument, parameter, candidate,
+                                                transfer=transfer or name in {"at", "dropLast"})
                 except LanguageError as failure:
                     if position > error_depth:
                         error, error_depth = failure, position
@@ -958,37 +1020,46 @@ class Checker:
             labels = ", ".join(ambiguous)
             raise LanguageError(node.token, f"ambiguous call to '{name}'; name arguments for {labels}")
         resolved, plan = solutions[0]
-        flow.nonzero = resolved.nonzero
+        flow.commit(resolved)
         call = None
         if self.facts is not None:
             call = (signature.key, tuple((parameters[index].name, mutable, value if mutable else None)
                                          for index, mutable, value in plan))
         return Checked(signature.output, Node(node.token, "invoke", (signature.key, plan, group)), call)
 
-    def check_argument(self, argument, parameter, flow):
+    def check_argument(self, argument, parameter, flow, *, transfer=False):
         if argument.mutable != parameter.mutable:
             required = "requires" if parameter.mutable else "does not accept"
             raise LanguageError(argument.token, f"parameter '{parameter.name}' {required} a mut argument")
         if not argument.mutable:
-            return self.expression(argument.expression, flow, parameter.type).node
+            value = self.expression(argument.expression, flow, parameter.type,
+                                    transfer=transfer, consume=parameter.owning,
+                                    borrow_shared=not (transfer or parameter.owning))
+            if not (transfer or parameter.owning) and self.contains_exclusive(value.type):
+                source = source_binding(argument.expression)
+                if source is not None:
+                    if source in flow.write_loans:
+                        raise LanguageError(argument.token, f"'{source}' is already mutably borrowed by this call")
+                    flow.loans |= {source}
+            return value.node
         if argument.expression.kind != "variable":
             raise LanguageError(argument.token, "a mut argument must be a variable")
         name, = argument.expression.fields
+        if name in flow.loans:
+            raise LanguageError(argument.token, f"mut argument '{name}' may alias another argument")
         binding = self.writable(flow, argument.token, name)
+        flow.loans |= {name}
+        flow.write_loans |= {name}
         if (binding.type.without_refinement() != parameter.type.without_refinement()
                 or (binding.type.nonzero and not parameter.type.nonzero)):
             raise LanguageError(argument.token, f"cannot pass mut {binding.type} to mut {parameter.type}")
         return binding.token
 
     def finish_mutable_arguments(self, flow, arguments):
-        for index, (argument, parameter, binding) in enumerate(arguments):
+        for argument, parameter, binding in arguments:
             name = binding.text
             if not compatible(flow.type_of(name), parameter.type):
                 raise LanguageError(argument.token, f"'{name}' needs a nonzero proof for mut {parameter.type}")
-            for _, other, previous in arguments[:index]:
-                alias = previous.text
-                if parameter.type.nonzero != other.type.nonzero and flow.may_alias(name, alias):
-                    raise LanguageError(argument.token, f"'{name}' and '{alias}' may alias with different refinements")
         for _, parameter, binding in arguments:
             if not parameter.type.nonzero:
                 flow.drop_proof(binding.text)

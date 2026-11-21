@@ -1,9 +1,13 @@
-fn update(refined: mut int32!0, unrestricted: mut int32) -> unit {
-    refined = 1;
-    unrestricted = 0;
+fn update(first: mut int32, second: mut int32) -> unit {
+    first = 1;
+    second = 0;
+}
+
+fn forward(target: mut int32) -> unit {
+    update(first: mut target, second: mut target);
 }
 
 fn main() -> unit {
-    let mut number: int32 = 1;
-    update(refined: mut number, unrestricted: mut number);
+    let mut number = 1;
+    forward(mut number);
 }

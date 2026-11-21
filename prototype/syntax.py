@@ -1,6 +1,6 @@
 """Source grammar and shared representations for the throwaway prototype."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import math
 from pathlib import Path
@@ -30,8 +30,12 @@ class Type:
     nonzero: bool = False
     module: str | None = None
 
+    shared: bool = False
+
     def __str__(self):
         name = self.name if self.module is None else f"{Path(self.module).stem}.{self.name}"
+        if self.shared:
+            name = f"shared {name}"
         name += "!0" if self.nonzero else ""
         if self.arguments:
             return f"{name}<{', '.join(map(str, self.arguments))}>"
@@ -45,10 +49,10 @@ class Type:
         return f"{name}<{units}>"
 
     def without_refinement(self):
-        return Type(self.name, self.arguments, self.units, module=self.module)
+        return replace(self, nonzero=False)
 
     def refined(self):
-        return Type(self.name, self.arguments, self.units, nonzero=True, module=self.module)
+        return replace(self, nonzero=True)
 
 
 BOOL = Type("bool")
@@ -105,6 +109,7 @@ class Parameter:
     token: Token
     type: Type
     mutable: bool = False
+    owning: bool = False
 
     @property
     def name(self):
@@ -365,7 +370,8 @@ class Parser:
         name = self.name()
         self.expect(":")
         mutable = bool(self.accept("mut"))
-        return Parameter(name, self.type(), mutable)
+        owning = not mutable and self.tokens[self.index + 1].kind == "name" and bool(self.accept("own"))
+        return Parameter(name, self.type(), mutable, owning)
 
     def record_field(self):
         name = self.name()
@@ -381,12 +387,15 @@ class Parser:
         return name, payload
 
     def type(self):
+        shared = self.accept("shared") if self.tokens[self.index + 1].kind == "name" else None
         token = self.qualified_name(self.take())
         name = token.text
+        if shared and name not in CAPABILITIES:
+            raise LanguageError(shared, "shared qualifies a host capability")
         if self.mock and name in CAPABILITIES:
             raise LanguageError(token, f"mock files cannot use host capability type '{name}'")
         if name in SIMPLE_TYPES:
-            return Type(name)
+            return Type(name, shared=bool(shared))
         if name == "list":
             self.type_angle("<")
             element = self.type()

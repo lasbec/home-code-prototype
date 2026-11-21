@@ -145,7 +145,7 @@ class ModuleRows:
             return {
                 "name": value.name, "module": self.paths[value.module] if value.module else None,
                 "arguments": self.data(value.arguments), "units": value.units,
-                "nonzero": value.nonzero,
+                "nonzero": value.nonzero, "shared": value.shared,
             }
         if is_dataclass(value):
             return {"class": type(value).__name__, **{
