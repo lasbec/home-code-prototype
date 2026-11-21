@@ -3,6 +3,7 @@
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
 
+from .channels import signatures as channels
 from .syntax import (
     BOOL, CAPABILITIES, CONSOLE, EXAMPLE_ERROR_MESSAGES, FILESYSTEM, FLOAT, GENERIC_TYPES, GUARANTEES, HOST_ERROR,
     HOST_ERROR_KIND, INDEX_ERROR, INT, INTEGER_BOUNDS, OVERFLOW, PARSE_INT_ERROR, RANDOM, RANDOM_DRAW, SIMPLE_TYPES,
@@ -48,7 +49,7 @@ PURE_FUNCTIONS = {
 }
 GENERIC_FUNCTIONS = {"add", "subtract", "min", "max", "nonzero", "at", "prepend", "dropLast", "toUint32"}
 CONSTRUCTORS = {"Ok", "Err"}
-BUILTIN_NAMES = HOST_FUNCTIONS.keys() | PURE_FUNCTIONS.keys() | GENERIC_FUNCTIONS | CONSTRUCTORS | threads.OPERATIONS
+BUILTIN_NAMES = HOST_FUNCTIONS.keys() | PURE_FUNCTIONS.keys() | GENERIC_FUNCTIONS | CONSTRUCTORS | threads.OPERATIONS | channels.OPERATIONS
 LITERAL_VALUE_KINDS = {"value", "integer", "decimal", "list", "variant", "call"}
 
 
@@ -174,10 +175,13 @@ class Checker:
         self.functions = {}
         self.imported_functions = {}
         self.record_names = {RANDOM_DRAW.name: RANDOM_DRAW}
-        self.enum_names = {HOST_ERROR_KIND.name: HOST_ERROR_KIND}
+        self.enum_names = {kind.name: kind for kind in (HOST_ERROR_KIND, *channels.ENUMS)}
         self.records = {RANDOM_DRAW: builtin(RANDOM_DRAW.name, (("value", INT), ("state", INT)),
                                              RANDOM_DRAW, GUARANTEES)}
-        self.enums = {HOST_ERROR_KIND: {"EndOfInput": None, "FileNotFound": None, "Other": None}}
+        self.enums = {
+            HOST_ERROR_KIND: {"EndOfInput": None, "FileNotFound": None, "Other": None},
+            **channels.ENUMS,
+        }
         self.public_types = {
             declaration.token.text: Type(declaration.token.text, module=module)
             for declaration in declarations
@@ -585,6 +589,8 @@ class Checker:
         if self.contains_exclusive(value.type) and source is not None and not borrowed:
             flow.move(subject.token, source)
         variants = self.enums.get(value.type)
+        if variants is None:
+            variants = channels.variants(value.type)
         if value.type.name == "result":
             variants = dict(zip(("Ok", "Err"), value.type.arguments))
         if variants is None:
@@ -909,6 +915,13 @@ class Checker:
             if self.mock_header:
                 raise LanguageError(node.token, f"mock files cannot call live host function '{name}'")
             signature = HOST_FUNCTIONS[name]
+        if name in channels.OPERATIONS:
+            handles = dict.fromkeys(
+                handle for arg in arguments if arg.label in {None, "channel"}
+                if (handle := self.type_hint((arg.expression,), flow, channels.HANDLES)) is not None
+            )
+            candidates = channels.signatures(node, handles, expected)
+            return self.bind_candidates(node, name, candidates, flow)
         if name in threads.OPERATIONS:
             handle = self.type_hint((arg.expression for arg in arguments), flow, {"Thread"})
             signature = threads.signature(node, handle)
@@ -916,6 +929,10 @@ class Checker:
             signature = self.generic_signature(name, arguments, flow, expected)
         if signature is None:
             raise LanguageError(node.token, f"unknown function '{name}'")
+        self.check_call_guarantees(node, name, signature)
+        return self.bind_arguments(node, name, signature, flow)
+
+    def check_call_guarantees(self, node, name, signature):
         missing = (self.current_function.modifiers & GUARANTEES) - signature.modifiers
         # A pure callee provides determinism, and a pure caller already requires purity.
         if "pure" in self.current_function.modifiers or "pure" in signature.modifiers:
@@ -923,7 +940,6 @@ class Checker:
         if missing:
             guarantees = ", ".join(sorted(missing))
             raise LanguageError(node.token, f"'{name}' lacks required guarantee(s): {guarantees}")
-        return self.bind_arguments(node, name, signature, flow)
 
     def example_error(self, node, flow):
         name = node.token.text
@@ -963,14 +979,18 @@ class Checker:
         if expected and expected.name == "list":
             candidates = [expected]
         candidates = list(dict.fromkeys(candidates or [Type("list", (INT,))]))
+        signatures = [builtin("prepend", (("item", items.arguments[0]), ("items", items)),
+                              items, GUARANTEES) for items in candidates]
+        return self.bind_candidates(node, "prepend", signatures, flow, transfer=True)
+
+    def bind_candidates(self, node, name, signatures, flow, *, transfer=False):
         solutions = []
         errors = []
-        for items in candidates:
-            signature = builtin("prepend", (("item", items.arguments[0]), ("items", items)),
-                                items, GUARANTEES)
+        for signature in signatures:
             trial = flow.copy()
             try:
-                value = self.bind_arguments(node, "prepend", signature, trial, transfer=True)
+                self.check_call_guarantees(node, name, signature)
+                value = self.bind_arguments(node, name, signature, trial, transfer=transfer)
             except LanguageError as error:
                 if str(error).startswith("ambiguous call"):
                     raise
@@ -980,7 +1000,7 @@ class Checker:
         if not solutions:
             raise errors[0]
         if len(solutions) > 1:
-            raise LanguageError(node.token, "prepend has multiple possible list types; add an explicit type")
+            raise LanguageError(node.token, f"'{name}' has multiple possible argument types; add an explicit type")
         value, trial = solutions[0]
         flow.commit(trial)
         return value

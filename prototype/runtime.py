@@ -11,6 +11,7 @@ from select import select
 from tempfile import NamedTemporaryFile
 from time import monotonic
 
+from .channels.buffer import OPERATIONS as CHANNEL_OPERATIONS
 from .checker import HOST_FUNCTIONS
 from .syntax import EXAMPLE_ERROR_MESSAGES, INTEGER_BOUNDS
 from .threads.scheduler import Scheduler
@@ -313,6 +314,8 @@ class Interpreter:
         return scheduler.run(self.invoke(name, arguments, scheduler))
 
     def invoke(self, name, arguments, scheduler):
+        if name in CHANNEL_OPERATIONS:
+            return CHANNEL_OPERATIONS[name](*arguments)
         if name == "join":
             return (yield from scheduler.join(*arguments))
         if name in HOST_FUNCTIONS and isinstance(arguments[0], MockCapability):

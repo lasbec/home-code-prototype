@@ -45,6 +45,18 @@ Grant `--threads` to a program whose `main` declares a `threads` capability. Wit
 
 `join(thread)` waits for the task and returns its `result<T, Killed>` outcome. Each holder can join independently. Tasks are scheduled in FIFO order at statements and loop iterations. A child can continue after its parent returns. If every task is waiting and none can wake, the interpreter reports a deadlock with the wait reasons.
 
+## Channels
+
+Grant `--channels` to a program whose `main` declares a `channels` capability. To create a channel, give `create_channel` a result type such as `Channel<int32>` through a binding annotation, return type, or `as` annotation.
+
+```text
+let queue: Channel<int32> = create_channel(channels, Capacity::Bounded(2));
+try_send(queue, 42);
+let result = try_receive(queue);
+```
+
+`Capacity::Bounded(n)` takes a positive `uint32!0`. `Capacity::Unbounded` allows any number of queued messages. Channel handles are shared and suffice to send and receive. A send consumes the message binding unless the value is shared. `try_send` returns `result<unit, TrySendError<T>>`, whose `Full(message)` error contains the original message. `try_receive` removes the oldest message or returns an `Empty` error.
+
 ## Mock host environments
 
 A mock is a self-contained `.proto` file that starts with `mock console`, `mock filesystem`, or `mock random`. Export every function for that environment in the host function table and keep other declarations private. Each export replaces the host capability parameter with `state: mut T`, where `T` is the same type across all exports. The remaining parameters, result type, and commutative group match the host signature. The mock can use host-independent built-ins and construct `HostError(kind: HostErrorKind::Other, message: "details")`.

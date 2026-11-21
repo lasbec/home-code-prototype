@@ -7,6 +7,7 @@ import signal
 import sqlite3
 import sys
 
+from .channels.buffer import Channels
 from .modules import ModuleLoader
 from .runtime import (
     Cell, Console, Filesystem, Interpreter, MockCapability, RandomSource, display, write_atomic,
@@ -200,6 +201,8 @@ def main():
         capabilities["random"] = RandomSource()
     if args.threads:
         capabilities["threads"] = Threads()
+    if args.channels:
+        capabilities["channels"] = Channels()
     functions = program.functions.copy()
     for provider, _, _ in mocks.values():
         functions.update(provider.functions)

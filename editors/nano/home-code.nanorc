@@ -7,8 +7,8 @@ color brightcyan "\<(commutative|deterministic|pure|ending)\>"
 # Highlight example entries while leaving calls such as input(console) alone.
 color brightcyan "\<(example|expect)\>" "\<(input|after)\>[[:blank:]]"
 
-color brightmagenta "\<(bool|console|f64|filesystem|int32|list|random|result|string|threads|uint32|Uint32|unit)\>"
-color brightmagenta "\<(HostError|HostErrorKind|IndexError|Killed|Thread|Overflow|ParseIntError|RandomDraw|Zero)\>"
+color brightmagenta "\<(bool|channels|console|f64|filesystem|int32|list|random|result|string|threads|uint32|Uint32|unit)\>"
+color brightmagenta "\<(Capacity|Channel|Empty|TrySendError|HostError|HostErrorKind|IndexError|Killed|Thread|Overflow|ParseIntError|RandomDraw|Zero)\>"
 color brightyellow "\<(false|true)\>" "(-|\<)[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?\>"
 color brightmagenta "\<(int32|uint32|Uint32)!0\>"
 
