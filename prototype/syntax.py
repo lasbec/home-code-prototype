@@ -492,6 +492,13 @@ class Parser:
             expression = self.expression()
             self.expect(";")
             return Node(token, "let", (name, declared, mutable, expression))
+        if token.text == "defer" and self.tokens[self.index + 1].kind == "name":
+            self.take()
+            call = self.expression()
+            if call.kind != "call":
+                raise LanguageError(token, "defer requires a call")
+            self.expect(";")
+            return Node(token, "defer", (call,))
         if self.accept("return"):
             expression = self.expression()
             self.expect(";")

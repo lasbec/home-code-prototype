@@ -15,7 +15,7 @@ from .channels import buffer as channels
 from .channels.api import OPERATIONS as CHANNEL_OPERATIONS
 from .checker import HOST_FUNCTIONS
 from .syntax import EXAMPLE_ERROR_MESSAGES, INTEGER_BOUNDS
-from .threads.scheduler import Scheduler
+from .threads.scheduler import Cancelled, Scheduler
 from .values import Failure, Result, Variant
 
 try:
@@ -321,6 +321,8 @@ class Interpreter:
             return (yield from channels.invoke(name, arguments, scheduler))
         if name == "join":
             return (yield from scheduler.join(*arguments))
+        if name == "kill":
+            return (yield from scheduler.kill(*arguments))
         if name in HOST_FUNCTIONS and isinstance(arguments[0], MockCapability):
             capability = arguments[0]
             return self.call((capability.module, name), (capability.state, *arguments[1:]))
@@ -355,6 +357,27 @@ class Interpreter:
                 yield f"mut parameter '{name}'", expected, actual
 
     def block(self, statements, environment, scheduler):
+        deferred = []
+        try:
+            outcome = yield from self.execute_block(statements, environment, scheduler, deferred)
+        except Cancelled:
+            yield from self.cleanup(deferred, scheduler)
+            raise
+        yield from self.cleanup(deferred, scheduler)
+        return outcome
+
+    def cleanup(self, deferred, scheduler):
+        if deferred:
+            task = scheduler.current
+            task.cleanup_depth += 1
+            try:
+                while deferred:
+                    name, arguments = deferred.pop()
+                    yield from self.invoke(name, arguments, scheduler)
+            finally:
+                task.cleanup_depth -= 1
+
+    def execute_block(self, statements, environment, scheduler, deferred):
         for node in statements:
             yield
             kind, fields = node.kind, node.fields
@@ -364,6 +387,10 @@ class Interpreter:
             elif kind == "assign":
                 binding, expression = fields
                 environment[binding.text].value = (yield from self.evaluate(expression, environment, scheduler))
+            elif kind == "defer":
+                name, plan, _ = fields[0].fields
+                arguments = yield from self.arguments(plan, environment, scheduler)
+                deferred.append((name, arguments))
             elif kind == "return":
                 return True, (yield from self.evaluate(fields[0], environment, scheduler))
             elif kind == "expression":

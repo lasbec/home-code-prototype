@@ -70,6 +70,10 @@ class Flow:
     moved: set = field(default_factory=set)
     loans: frozenset = frozenset()
     write_loans: frozenset = frozenset()
+    deferred_values: frozenset = frozenset()
+    deferred_cells: frozenset = frozenset()
+    deferred_refined: frozenset = frozenset()
+    deferred_writes: frozenset = frozenset()
 
     def copy(self):
         return replace(self, bindings=self.bindings.copy(), nonzero=self.nonzero.copy(),
@@ -84,6 +88,8 @@ class Flow:
             raise LanguageError(token, f"loop source '{name}' is read-only in the loop body")
         if name in self.loans:
             raise LanguageError(token, f"'{name}' is already borrowed by this call")
+        if name in self.deferred_values:
+            raise LanguageError(token, f"'{name}' is borrowed by a deferred call")
 
     def drop_proof(self, name):
         self.nonzero.discard(name)
@@ -104,14 +110,19 @@ class Flow:
     def move(self, token, name):
         binding = self.require(token, name)
         self.ensure_unprotected(token, name)
-        if binding.borrowed:
+        if binding.borrowed or name in self.deferred_cells:
             raise LanguageError(token, f"cannot move borrowed value '{name}'")
         self.moved.add(name)
         self.drop_proof(name)
 
-    def commit(self, trial):
+    def commit(self, trial, *, deferred=False):
         self.nonzero = trial.nonzero
         self.moved = trial.moved
+        if deferred:
+            self.deferred_values = trial.deferred_values
+            self.deferred_cells = trial.deferred_cells
+            self.deferred_refined = trial.deferred_refined
+            self.deferred_writes = trial.deferred_writes
 
 
 @dataclass(frozen=True)
@@ -494,11 +505,20 @@ class Checker:
     def block(self, statements, flow, *, reachable=True):
         checked = []
         ends = not reachable
+        inherited_values = flow.deferred_values
+        inherited_cells = flow.deferred_cells
+        inherited_refined = flow.deferred_refined
+        inherited_writes, flow.deferred_writes = flow.deferred_writes, frozenset()
         for statement in statements:
             if ends:
                 raise LanguageError(statement.token, "unreachable statement")
             lowered, ends = self.statement(statement, flow)
             checked.append(lowered)
+        flow.nonzero -= flow.deferred_writes
+        flow.deferred_values = inherited_values
+        flow.deferred_cells = inherited_cells
+        flow.deferred_refined = inherited_refined
+        flow.deferred_writes = inherited_writes
         return tuple(checked), ends
 
     def statement(self, node, flow):
@@ -516,6 +536,8 @@ class Checker:
             name, expression = fields
             binding = self.writable(flow, name, name.text, read=False)
             value = self.expression(expression, flow, binding.type, transfer=True)
+            if name.text in flow.deferred_refined and not value.type.nonzero:
+                raise LanguageError(name, f"'{name.text}' must stay nonzero for a deferred call")
             flow.moved.discard(name.text)
             flow.drop_proof(name.text)
             if value.type.nonzero:
@@ -527,6 +549,11 @@ class Checker:
             return Node(node.token, kind, (value.node,)), True
         elif kind == "expression":
             lowered = (self.expression(fields[0], flow).node,)
+        elif kind == "defer":
+            call = self.expression(fields[0], flow, deferred=True)
+            if call.node.kind != "invoke":
+                raise LanguageError(node.token, "defer requires a function call")
+            lowered = (call.node,)
         elif kind == "if":
             condition, yes, no = fields
             value = self.expression(condition, flow, BOOL)
@@ -643,8 +670,8 @@ class Checker:
         return binding
 
     def expression(self, node, flow, expected=None, *, transfer=False, consume=False,
-                   borrow_shared=False, move_ordinary=False):
-        checked = self.infer(node, flow, expected)
+                   borrow_shared=False, move_ordinary=False, deferred=False):
+        checked = self.infer(node, flow, expected, deferred=deferred)
         actual = checked.type
         shared_borrow = borrow_shared and actual.shared and replace(actual, shared=False) == expected
         if consume and actual.is_shared:
@@ -669,7 +696,7 @@ class Checker:
     def literal(self, node, expected):
         return self.expression(node, Flow(literal_context="mock state"), expected).node
 
-    def infer(self, node, flow, expected):
+    def infer(self, node, flow, expected, *, deferred=False):
         kind, fields = node.kind, node.fields
         if flow.literal_context and kind not in LITERAL_VALUE_KINDS:
             raise LanguageError(node.token, f"{flow.literal_context} values must be literals")
@@ -728,7 +755,7 @@ class Checker:
             self.remember(lowered, node.token, "case_reference", (value_type, tag))
             return Checked(value_type, lowered)
         if kind == "call":
-            return self.call(node, flow, expected)
+            return self.call(node, flow, expected, deferred=deferred)
         if kind == "thread":
             return self.start_thread(node, flow)
         if kind == "binary":
@@ -884,7 +911,7 @@ class Checker:
         lowered = Node(node.token, "thread", (*call.node.fields, capabilities[0]))
         return Checked(Type("Thread", (task.output,)), lowered, call.call)
 
-    def call(self, node, flow, expected, name=None):
+    def call(self, node, flow, expected, name=None, *, deferred=False):
         name = name or node.token.text
         arguments = node.fields
         if name in CONSTRUCTORS:
@@ -908,7 +935,7 @@ class Checker:
             raise LanguageError(node.token, f"{flow.literal_context} values must be literals; "
                                 "ordinary calls are not allowed")
         if name == "prepend":
-            return self.prepend(node, flow, expected)
+            return self.prepend(node, flow, expected, deferred=deferred)
         signature = (self.functions.get(name) or self.imported_functions.get(name)
                      or PURE_FUNCTIONS.get(name))
         if signature is None and name in HOST_FUNCTIONS:
@@ -921,7 +948,7 @@ class Checker:
                 if (handle := self.type_hint((arg.expression,), flow, channels.HANDLES)) is not None
             )
             candidates = channels.signatures(node, handles, expected)
-            return self.bind_candidates(node, name, candidates, flow)
+            return self.bind_candidates(node, name, candidates, flow, deferred=deferred)
         if name in threads.OPERATIONS:
             handle = self.type_hint((arg.expression for arg in arguments), flow, {"Thread"})
             signature = threads.signature(node, handle)
@@ -930,7 +957,7 @@ class Checker:
         if signature is None:
             raise LanguageError(node.token, f"unknown function '{name}'")
         self.check_call_guarantees(node, name, signature)
-        return self.bind_arguments(node, name, signature, flow)
+        return self.bind_arguments(node, name, signature, flow, deferred=deferred)
 
     def check_call_guarantees(self, node, name, signature):
         missing = (self.current_function.modifiers & GUARANTEES) - signature.modifiers
@@ -966,7 +993,7 @@ class Checker:
         return Checked(signature.output, Node(node.token, "record", (signature.output.name, fields, plan)),
                        value.call)
 
-    def prepend(self, node, flow, expected):
+    def prepend(self, node, flow, expected, *, deferred=False):
         candidates = []
         for argument in node.fields:
             inferred = self.type_hint((argument.expression,), flow)
@@ -981,16 +1008,16 @@ class Checker:
         candidates = list(dict.fromkeys(candidates or [Type("list", (INT,))]))
         signatures = [builtin("prepend", (("item", items.arguments[0]), ("items", items)),
                               items, GUARANTEES) for items in candidates]
-        return self.bind_candidates(node, "prepend", signatures, flow, transfer=True)
+        return self.bind_candidates(node, "prepend", signatures, flow, transfer=True, deferred=deferred)
 
-    def bind_candidates(self, node, name, signatures, flow, *, transfer=False):
+    def bind_candidates(self, node, name, signatures, flow, *, transfer=False, deferred=False):
         solutions = []
         errors = []
         for signature in signatures:
             trial = flow.copy()
             try:
                 self.check_call_guarantees(node, name, signature)
-                value = self.bind_arguments(node, name, signature, trial, transfer=transfer)
+                value = self.bind_arguments(node, name, signature, trial, transfer=transfer, deferred=deferred)
             except LanguageError as error:
                 if str(error).startswith("ambiguous call"):
                     raise
@@ -1002,10 +1029,10 @@ class Checker:
         if len(solutions) > 1:
             raise LanguageError(node.token, f"'{name}' has multiple possible argument types; add an explicit type")
         value, trial = solutions[0]
-        flow.commit(trial)
+        flow.commit(trial, deferred=deferred)
         return value
 
-    def bind_arguments(self, node, name, signature, flow, *, transfer=False, starting=False):
+    def bind_arguments(self, node, name, signature, flow, *, transfer=False, starting=False, deferred=False):
         arguments, parameters = node.fields, signature.parameters
         if len(arguments) != len(parameters):
             raise LanguageError(node.token, f"'{name}' expects {len(parameters)} arguments, got {len(arguments)}")
@@ -1031,7 +1058,7 @@ class Checker:
                 return
             if position == len(arguments):
                 try:
-                    self.finish_mutable_arguments(trial, mutable_arguments)
+                    self.finish_mutable_arguments(trial, mutable_arguments, deferred=deferred)
                 except LanguageError as failure:
                     error, error_depth = failure, position
                     return
@@ -1075,7 +1102,9 @@ class Checker:
             labels = ", ".join(ambiguous)
             raise LanguageError(node.token, f"ambiguous call to '{name}'; name arguments for {labels}")
         resolved, plan = solutions[0]
-        flow.commit(resolved)
+        if deferred:
+            resolved.deferred_values |= resolved.loans - resolved.write_loans
+        flow.commit(resolved, deferred=deferred)
         call = None
         if self.facts is not None:
             call = (name if signature.name.startswith("uint32:") else signature.key,
@@ -1107,16 +1136,23 @@ class Checker:
         binding = self.writable(flow, argument.token, name)
         flow.loans |= {name}
         flow.write_loans |= {name}
+        if name in flow.deferred_refined and not parameter.type.nonzero:
+            raise LanguageError(argument.token, f"'{name}' must stay nonzero for a deferred call")
         if (binding.type.without_refinement() != parameter.type.without_refinement()
                 or (binding.type.nonzero and not parameter.type.nonzero)):
             raise LanguageError(argument.token, f"cannot pass mut {binding.type} to mut {parameter.type}")
         return binding.token
 
-    def finish_mutable_arguments(self, flow, arguments):
+    def finish_mutable_arguments(self, flow, arguments, *, deferred):
         for argument, parameter, binding in arguments:
             name = binding.text
             if not compatible(flow.type_of(name), parameter.type):
                 raise LanguageError(argument.token, f"'{name}' needs a nonzero proof for mut {parameter.type}")
-        for _, parameter, binding in arguments:
-            if not parameter.type.nonzero:
-                flow.drop_proof(binding.text)
+            if deferred:
+                flow.deferred_cells |= {name}
+                if parameter.type.nonzero:
+                    flow.deferred_refined |= {name}
+                else:
+                    flow.deferred_writes |= {name}
+            elif not parameter.type.nonzero:
+                flow.drop_proof(name)

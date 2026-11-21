@@ -3,6 +3,8 @@
 from io import StringIO
 import unittest
 
+from prototype.channels.api import OPERATIONS
+from prototype.channels.buffer import Channel, Channels
 from prototype.checker import Checker
 from prototype.runtime import Console, Interpreter, display
 from prototype.syntax import LanguageError, Parser
@@ -94,3 +96,154 @@ class GreenThreads(unittest.TestCase):
             ending fn start(w: threads) -> Thread<unit> { return thread task(); }
             fn task() -> unit {}
         """)
+
+    def test_defer_captures_values_and_runs_lifo_at_each_block_exit(self):
+        program = compile_program("""
+            fn log(output: console, number: int32) -> unit {
+                print(output, formatInt32(number));
+            }
+            fn update(number: mut int32) -> unit { number = 4; }
+            fn main(output: own console) -> int32 {
+                let mut number = 1;
+                defer log(output, number);
+                number = 2;
+                if true {
+                    defer update(mut number);
+                    defer log(output, number);
+                    defer log(output, 3);
+                }
+                return number;
+            }
+        """)
+        output = StringIO()
+        result = Interpreter(program).call("main", (Console(StringIO(), output),))
+        self.assertEqual(result, 4)
+        self.assertEqual(output.getvalue(), "3\n2\n1\n")
+
+    def test_kill_interrupts_a_loop_and_waits_for_cleanup(self):
+        program = compile_program("""
+            fn busy(output: shared console) -> unit {
+                defer print(output, "cleanup");
+                loop {}
+            }
+            fn main(workers: threads, output: shared console) -> result<unit, Killed> {
+                let child = thread busy(output);
+                unit;
+                kill(child);
+                print(output, "joined cleanup");
+                kill(child);
+                return join(child);
+            }
+        """)
+        output = StringIO()
+        value = Interpreter(program).call("main", (Threads(), Console(StringIO(), output)))
+        self.assertEqual(display(value), "Err(Killed)")
+        self.assertEqual(output.getvalue(), "cleanup\njoined cleanup\n")
+
+    def test_self_kill_runs_cleanup_once_and_all_joiners_agree(self):
+        program = compile_program("""
+            fn task(own_handle: Channel<Thread<unit>>, output: shared console) -> unit {
+                defer print(output, "cleanup");
+                kill(receive_blocking(own_handle));
+                print(output, "unreachable at runtime");
+            }
+            fn report(target: Thread<unit>, output: shared console) -> unit {
+                match join(target) {
+                    Ok(value) { print(output, "returned"); }
+                    Err(error) { print(output, "killed"); }
+                }
+            }
+            fn main(workers: threads, channels: channels, output: shared console) -> result<unit, Killed> {
+                let q: Channel<Thread<unit>> = create_channel(channels, Capacity::Bounded(1));
+                let child = thread task(q, output);
+                thread report(child, output);
+                thread report(child, output);
+                send_blocking(q, child);
+                return join(child);
+            }
+        """)
+        output = StringIO()
+        value = Interpreter(program).call("main", (Threads(), Channels(), Console(StringIO(), output)))
+        self.assertEqual(display(value), "Err(Killed)")
+        self.assertEqual(output.getvalue(), "cleanup\nkilled\nkilled\n")
+
+    def test_kill_removes_parked_join_and_uncommitted_send(self):
+        scheduler = Scheduler()
+        queue = Channel(1)
+        children = []
+
+        def parent():
+            child = scheduler.start(queue.send(scheduler, OPERATIONS["send_blocking"], 2))
+            children.append(child)
+            yield from scheduler.join(child)
+
+        def exercise():
+            yield from queue.send(scheduler, OPERATIONS["try_send"], 1)
+            task = scheduler.start(parent())
+            yield
+            yield
+            self.assertTrue(queue.senders)
+            yield from scheduler.kill(task)
+            self.assertEqual(task.outcome.tag, "Err")
+            self.assertEqual(children[0].outcome.tag, "Err")
+            self.assertEqual(children[0].joiners, {})
+            self.assertFalse(queue.senders)
+            return list(queue.messages)
+
+        self.assertEqual(scheduler.run(exercise()), [1])
+
+    def test_cancellation_after_commit_keeps_message_and_terminal_result(self):
+        scheduler = Scheduler()
+        queue = Channel(1)
+
+        def exercise():
+            yield from queue.send(scheduler, OPERATIONS["try_send"], 1)
+            sender = scheduler.start(queue.send(scheduler, OPERATIONS["send_blocking"], 2))
+            yield
+            self.assertEqual((yield from queue.receive(scheduler, OPERATIONS["receive_blocking"])), 1)
+            yield from scheduler.kill(sender)
+            self.assertEqual(sender.outcome.tag, "Err")
+            self.assertEqual(list(queue.messages), [2])
+            finished = scheduler.start(queue.receive(scheduler, OPERATIONS["receive_blocking"]))
+            result = yield from scheduler.join(finished)
+            yield from scheduler.kill(finished)
+            self.assertIs((yield from scheduler.join(finished)), result)
+            return result.value
+
+        self.assertEqual(scheduler.run(exercise()), 2)
+
+    def test_cleanup_in_progress_finishes_on_cancellation(self):
+        program = compile_program("""
+            fn cleanup(gate: Channel<int32>, output: shared console) -> unit {
+                print(output, "cleanup starts");
+                receive_blocking(gate);
+                print(output, "cleanup finishes");
+            }
+            fn task(gate: Channel<int32>, output: shared console) -> int32 {
+                defer cleanup(gate, output);
+                return 1;
+            }
+            fn cancel(target: Thread<int32>) -> unit { kill(target); }
+            fn main(workers: threads, channels: channels, output: shared console) -> result<int32, Killed> {
+                let gate: Channel<int32> = create_channel(channels, Capacity::Bounded(1));
+                let child = thread task(gate, output);
+                unit;
+                unit;
+                unit;
+                unit;
+                let killer = thread cancel(child);
+                unit;
+                unit;
+                try_send(gate, 1);
+                join(killer);
+                return join(child);
+            }
+        """)
+        output = StringIO()
+        value = Interpreter(program).call("main", (Threads(), Channels(), Console(StringIO(), output)))
+        self.assertEqual(output.getvalue(), "cleanup starts\ncleanup finishes\n")
+        self.assertEqual(display(value), "Err(Killed)")
+
+    def test_ending_cannot_defer_an_ordinary_kill(self):
+        with self.assertRaisesRegex(LanguageError, "lacks required guarantee.*ending"):
+            compile_program("ending fn stop(target: Thread<unit>) -> unit { defer kill(target); }")

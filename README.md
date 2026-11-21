@@ -45,6 +45,10 @@ Grant `--threads` to a program whose `main` declares a `threads` capability. Wit
 
 `join(thread)` waits for the task and returns its `result<T, Killed>` outcome. Each holder can join independently. Tasks are scheduled in FIFO order at statements and loop iterations. A child can continue after its parent returns. If every task is waiting and none can wake, the interpreter reports a deadlock with the wait reasons.
 
+`kill(thread)` requests cancellation of the target and its descendants and waits for the target's own cleanup. A self-kill unwinds the caller. Once a task finishes, later joins and kills leave its outcome intact. An `ending` function may start threads, but ordinary `join` and `kill` lack the ending guarantee.
+
+Use `defer cleanup(args);` to register a call on the current block. Argument expressions run at registration. Mutable arguments capture their storage. Deferred calls run in reverse order on block exit, including early return and cancellation. Cancellation lets cleanup in progress finish.
+
 ## Channels
 
 Grant `--channels` to a program whose `main` declares a `channels` capability. To create a channel, give `create_channel` a result type such as `Channel<int32>` through a binding annotation, return type, or `as` annotation.
