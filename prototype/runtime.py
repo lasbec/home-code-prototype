@@ -13,6 +13,8 @@ from time import monotonic
 
 from .checker import HOST_FUNCTIONS
 from .syntax import EXAMPLE_ERROR_MESSAGES, INTEGER_BOUNDS
+from .threads.scheduler import Scheduler
+from .values import Failure, Result, Variant
 
 try:
     import termios
@@ -27,29 +29,9 @@ class Cell:
 
 
 @dataclass(frozen=True)
-class Result:
-    tag: str
-    value: object
-
-
-@dataclass(frozen=True)
 class Record:
     name: str
     fields: tuple
-
-
-@dataclass(frozen=True)
-class Variant:
-    name: str
-    tag: str
-    value: object = None
-    has_payload: bool = field(default=False, compare=False, repr=False)
-
-
-@dataclass(frozen=True)
-class Failure:
-    code: str
-    message: str = ""
 
 
 @dataclass(frozen=True)
@@ -327,6 +309,12 @@ class Interpreter:
         self.functions = functions
 
     def call(self, name, arguments):
+        scheduler = Scheduler()
+        return scheduler.run(self.invoke(name, arguments, scheduler))
+
+    def invoke(self, name, arguments, scheduler):
+        if name == "join":
+            return (yield from scheduler.join(*arguments))
         if name in HOST_FUNCTIONS and isinstance(arguments[0], MockCapability):
             capability = arguments[0]
             return self.call((capability.module, name), (capability.state, *arguments[1:]))
@@ -337,7 +325,7 @@ class Interpreter:
             parameter.name: argument if parameter.mutable else Cell(argument)
             for parameter, argument in zip(function.parameters, arguments, strict=True)
         }
-        _, value = self.block(function.body, environment)
+        _, value = yield from self.block(function.body, environment, scheduler)
         return value
 
     def example_mismatches(self, function, example):
@@ -360,97 +348,116 @@ class Interpreter:
             if actual != expected:
                 yield f"mut parameter '{name}'", expected, actual
 
-    def block(self, statements, environment):
+    def block(self, statements, environment, scheduler):
         for node in statements:
+            yield
             kind, fields = node.kind, node.fields
             if kind == "let":
                 binding, expression, _ = fields
-                environment[binding.text] = Cell(self.expression(expression, environment))
+                environment[binding.text] = Cell((yield from self.evaluate(expression, environment, scheduler)))
             elif kind == "assign":
                 binding, expression = fields
-                environment[binding.text].value = self.expression(expression, environment)
+                environment[binding.text].value = (yield from self.evaluate(expression, environment, scheduler))
             elif kind == "return":
-                return True, self.expression(fields[0], environment)
+                return True, (yield from self.evaluate(fields[0], environment, scheduler))
             elif kind == "expression":
-                self.expression(fields[0], environment)
+                (yield from self.evaluate(fields[0], environment, scheduler))
             else:
-                returns, value = self.control(node, environment)
+                returns, value = yield from self.control(node, environment, scheduler)
                 if returns:
                     return True, value
         return False, None
 
-    def control(self, node, environment):
+    def control(self, node, environment, scheduler):
         kind, fields = node.kind, node.fields
         if kind == "if":
             condition, yes, no = fields
-            return self.block(yes if self.expression(condition, environment) else no,
-                              environment.copy())
+            branch = yes if (yield from self.evaluate(condition, environment, scheduler)) else no
+            return (yield from self.block(branch, environment.copy(), scheduler))
         if kind == "match":
             subject, arms = fields
-            result = self.expression(subject, environment)
+            result = (yield from self.evaluate(subject, environment, scheduler))
             name, body = arms[result.tag]
             scope = environment.copy()
             if name is not None:
                 scope[name] = Cell(result.value)
-            return self.block(body, scope)
+            return (yield from self.block(body, scope, scheduler))
         if kind == "loop":
             while True:
-                returns, value = self.block(fields[0], environment.copy())
+                yield
+                returns, value = yield from self.block(fields[0], environment.copy(), scheduler)
                 if returns:
                     return True, value
         if kind == "for":
             name, source, body = fields
-            for item in self.expression(source, environment):
-                returns, value = self.block(body, {**environment, name: Cell(item)})
+            for item in (yield from self.evaluate(source, environment, scheduler)):
+                yield
+                returns, value = yield from self.block(body, {**environment, name: Cell(item)}, scheduler)
                 if returns:
                     return True, value
             return False, None
         raise AssertionError(kind)
 
     def expression(self, node, environment):
+        scheduler = Scheduler()
+        return scheduler.run(self.evaluate(node, environment, scheduler))
+
+    def evaluate(self, node, environment, scheduler):
         kind, fields = node.kind, node.fields
         if kind == "value":
             return fields[0]
         if kind == "variable":
             return environment[fields[0]].value
         if kind == "list":
-            return tuple(self.expression(item, environment) for item in fields)
+            items = []
+            for item in fields:
+                items.append((yield from self.evaluate(item, environment, scheduler)))
+            return tuple(items)
         if kind == "result":
             tag, value = fields
-            return Result(tag, self.expression(value, environment))
+            return Result(tag, (yield from self.evaluate(value, environment, scheduler)))
         if kind == "failure":
             code, message = fields
-            return Failure(code, "" if message is None else self.expression(message, environment))
+            return Failure(code, "" if message is None else (yield from self.evaluate(message, environment, scheduler)))
         if kind == "host_failure":
-            error_kind, message = self.arguments(fields[0], environment)
+            error_kind, message = (yield from self.arguments(fields[0], environment, scheduler))
             return Failure(error_kind.tag, message)
         if kind == "variant":
             name, tag, payload = fields
-            value = None if payload is None else self.expression(payload, environment)
+            value = None if payload is None else (yield from self.evaluate(payload, environment, scheduler))
             return Variant(name, tag, value, has_payload=payload is not None)
         if kind == "record":
             name, labels, plan = fields
-            arguments = self.arguments(plan, environment)
+            arguments = (yield from self.arguments(plan, environment, scheduler))
             return Record(name, tuple(zip(labels, arguments, strict=True)))
         if kind == "field":
             value, index = fields
-            return self.expression(value, environment).fields[index][1]
+            return (yield from self.evaluate(value, environment, scheduler)).fields[index][1]
         if kind == "binary":
             left, right, _, *integer = fields
-            first = self.expression(left, environment)
-            second = self.expression(right, environment)
+            first = (yield from self.evaluate(left, environment, scheduler))
+            second = (yield from self.evaluate(right, environment, scheduler))
             if node.token.text == "*":
                 return checked_int(first * second, integer[0])
             return OPERATORS[node.token.text](first, second)
+        if kind == "thread":
+            name, plan, _, capability = fields
+            owner = environment[capability].value
+            arguments = yield from self.arguments(plan, environment, scheduler)
+            return owner.start(scheduler, self.invoke(name, arguments, scheduler))
         if kind == "invoke":
             name, plan, _ = fields
-            return self.call(name, self.arguments(plan, environment))
+            arguments = yield from self.arguments(plan, environment, scheduler)
+            return (yield from self.invoke(name, arguments, scheduler))
         raise AssertionError(kind)
 
-    def arguments(self, plan, environment):
+    def arguments(self, plan, environment, scheduler):
         arguments = [None] * len(plan)
         for slot, mutable, value in plan:
-            arguments[slot] = environment[value.text] if mutable else self.expression(value, environment)
+            if mutable:
+                arguments[slot] = environment[value.text]
+            else:
+                arguments[slot] = yield from self.evaluate(value, environment, scheduler)
         return arguments
 
 

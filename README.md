@@ -39,6 +39,12 @@ The host functions run immediately when called. `write` flushes text as supplied
 
 `random(source, bound0, bound1)` draws a uniform integer from the inclusive range. `pseudoRandom(state: seed, bound0, bound1)` is a pure, deterministic, terminating built-in for repeatable sequences. It returns a `RandomDraw` record with `value` and the next `state`, both `int32`. Pass the returned state into the next call. Each call takes one generator step, even when the bounds are equal. Both functions accept the bounds in either order. `pseudoRandom` maps its 32-bit outputs as evenly as possible across the range and is intended for simulations and games.
 
+## Green threads
+
+Grant `--threads` to a program whose `main` declares a `threads` capability. With exactly one such capability in scope, `thread task(...)` starts a named function and returns a shared `Thread<T>` for task result type `T`. Arguments are evaluated in source order. Ordinary bindings are moved, shared handles and capabilities remain available, and exclusive task parameters require `own`.
+
+`join(thread)` waits for the task and returns its `result<T, Killed>` outcome. Each holder can join independently. Tasks are scheduled in FIFO order at statements and loop iterations. A child can continue after its parent returns. If every task is waiting and none can wake, the interpreter reports a deadlock with the wait reasons.
+
 ## Mock host environments
 
 A mock is a self-contained `.proto` file that starts with `mock console`, `mock filesystem`, or `mock random`. Export every function for that environment in the host function table and keep other declarations private. Each export replaces the host capability parameter with `state: mut T`, where `T` is the same type across all exports. The remaining parameters, result type, and commutative group match the host signature. The mock can use host-independent built-ins and construct `HostError(kind: HostErrorKind::Other, message: "details")`.

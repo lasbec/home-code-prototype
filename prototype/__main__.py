@@ -12,7 +12,8 @@ from .runtime import (
     Cell, Console, Filesystem, Interpreter, MockCapability, RandomSource, display, write_atomic,
 )
 from .snapshot import export_program, save_program
-from .syntax import CAPABILITIES, UNIT, LanguageError
+from .syntax import CAPABILITIES, MOCK_CAPABILITIES, UNIT, LanguageError
+from .threads.scheduler import Threads
 
 
 def terminate(signum, _frame):
@@ -57,7 +58,7 @@ def report_error(source, error):
 
 
 def add_state_options(command, *, output=False):
-    for environment in CAPABILITIES:
+    for environment in MOCK_CAPABILITIES:
         command.add_argument(f"--{environment}-state", type=Path, metavar="FILE",
                              help=f"read initial state for the {environment} mock")
         if output:
@@ -75,7 +76,7 @@ def cli_arguments(arguments):
             return result + arguments[index:]
         option, equals, path = argument.partition("=")
         environment = option[2:]
-        if equals and option.startswith("--") and environment in CAPABILITIES:
+        if equals and option.startswith("--") and environment in MOCK_CAPABILITIES:
             argument = f"--_{environment}-mock={path}"
         result.append(argument)
     return result
@@ -83,7 +84,7 @@ def cli_arguments(arguments):
 
 def load_mocks(args, cli):
     mocks = {}
-    for environment in CAPABILITIES:
+    for environment in MOCK_CAPABILITIES:
         paths = getattr(args, f"_{environment}_mock") or []
         state = getattr(args, f"{environment}_state")
         output = getattr(args, f"{environment}_state_out")
@@ -134,9 +135,11 @@ def main():
     run = commands.add_parser("run", help="validate and run main")
     run.add_argument("source", type=Path)
     for environment in CAPABILITIES:
-        run.add_argument(f"--{environment}", action="store_true",
-                         help=f"use live {environment}, or use --{environment}=MOCK to load a .proto mock")
-        run.add_argument(f"--_{environment}-mock", action="append", type=Path, help=argparse.SUPPRESS)
+        help_text = f"grant the {environment} capability"
+        if environment in MOCK_CAPABILITIES:
+            help_text += f", or use --{environment}=MOCK to load a .proto mock"
+            run.add_argument(f"--_{environment}-mock", action="append", type=Path, help=argparse.SUPPRESS)
+        run.add_argument(f"--{environment}", action="store_true", help=help_text)
     add_state_options(run, output=True)
     args = cli.parse_args(cli_arguments(sys.argv[1:]))
     if args.command in {"save", "export"}:
@@ -157,7 +160,7 @@ def main():
         report_error(args.source, error)
         return 1
     if args.command == "check":
-        for environment in CAPABILITIES:
+        for environment in MOCK_CAPABILITIES:
             state = getattr(args, f"{environment}_state")
             if state is None:
                 continue
@@ -195,6 +198,8 @@ def main():
         capabilities["filesystem"] = Filesystem()
     if args.random:
         capabilities["random"] = RandomSource()
+    if args.threads:
+        capabilities["threads"] = Threads()
     functions = program.functions.copy()
     for provider, _, _ in mocks.values():
         functions.update(provider.functions)
@@ -227,7 +232,7 @@ def main():
     except RecursionError:
         print("prototype interpreter reached its call stack limit", file=sys.stderr)
         return 1
-    except OSError as error:
+    except (OSError, RuntimeError) as error:
         print(error, file=sys.stderr)
         return 1
     if value is not None:

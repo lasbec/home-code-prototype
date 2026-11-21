@@ -4,20 +4,13 @@ from collections import defaultdict
 from dataclasses import dataclass, field, replace
 
 from .syntax import (
-    BOOL, CAPABILITIES, CONSOLE, EXAMPLE_ERROR_MESSAGES, FILESYSTEM, FLOAT, GUARANTEES, HOST_ERROR,
+    BOOL, CAPABILITIES, CONSOLE, EXAMPLE_ERROR_MESSAGES, FILESYSTEM, FLOAT, GENERIC_TYPES, GUARANTEES, HOST_ERROR,
     HOST_ERROR_KIND, INDEX_ERROR, INT, INTEGER_BOUNDS, OVERFLOW, PARSE_INT_ERROR, RANDOM, RANDOM_DRAW, SIMPLE_TYPES,
-    STRING, UINT, UNIT, ZERO, Argument, EnumDeclaration, Function, LanguageError, Node, Parameter,
-    RecordDeclaration, Token, Type, product_units, quotient_units, result_type,
+    STRING, THREADS, UINT, UNIT, ZERO, Argument, EnumDeclaration, Function, LanguageError, Node, Parameter,
+    RecordDeclaration, Token, Type, builtin, product_units, quotient_units, result_type,
 )
 
-
-def builtin(name, parameters, output, modifiers=frozenset(), commutative=()):
-    if commutative:
-        modifiers = modifiers | {"commutative"}
-    return Function(Token(name, 0, 0), modifiers, tuple(
-        Parameter(Token(label, 0, 0), parameter_type)
-        for label, parameter_type in parameters
-    ), output, commutative=commutative)
+from .threads import signatures as threads
 
 
 HOST_FUNCTIONS = {
@@ -55,7 +48,7 @@ PURE_FUNCTIONS = {
 }
 GENERIC_FUNCTIONS = {"add", "subtract", "min", "max", "nonzero", "at", "prepend", "dropLast", "toUint32"}
 CONSTRUCTORS = {"Ok", "Err"}
-BUILTIN_NAMES = HOST_FUNCTIONS.keys() | PURE_FUNCTIONS.keys() | GENERIC_FUNCTIONS | CONSTRUCTORS
+BUILTIN_NAMES = HOST_FUNCTIONS.keys() | PURE_FUNCTIONS.keys() | GENERIC_FUNCTIONS | CONSTRUCTORS | threads.OPERATIONS
 LITERAL_VALUE_KINDS = {"value", "integer", "decimal", "list", "variant", "call"}
 
 
@@ -206,7 +199,7 @@ class Checker:
             })
         self.current_function = None
         used_names = (BUILTIN_NAMES - self.mock_operations.keys()) | {RANDOM_DRAW.name}
-        builtin_types = SIMPLE_TYPES | INTEGER_BOUNDS.keys() | {"Uint32", "f64", "result", "list"}
+        builtin_types = SIMPLE_TYPES | INTEGER_BOUNDS.keys() | GENERIC_TYPES.keys() | {"Uint32", "f64"}
         for declaration in declarations:
             token = declaration.token
             name = token.text
@@ -289,7 +282,7 @@ class Checker:
             self.check_public_type(argument, token)
 
     def contains_exclusive(self, value_type, seen=frozenset()):
-        if value_type in seen:
+        if value_type.is_shared or value_type in seen:
             return False
         if value_type.name in CAPABILITIES and value_type.module is None:
             return not value_type.shared
@@ -330,7 +323,7 @@ class Checker:
         for function in self.functions.values():
             self.current_function = function
             for parameter in function.parameters:
-                if parameter.owning and parameter.type.shared:
+                if parameter.owning and parameter.type.is_shared:
                     raise LanguageError(parameter.token, "own cannot consume a shared value")
             flow = Flow()
             for parameter in function.parameters:
@@ -451,8 +444,8 @@ class Checker:
         # Lowered calls carry their actual destination slots. Walk visits each call
         # before its operands, so only direct uses in a complete group are allowed.
         for node in walk(body):
-            if node.kind == "invoke":
-                _, plan, destinations = node.fields
+            if node.kind in {"invoke", "thread"}:
+                _, plan, destinations, *_ = node.fields
             elif node.kind == "binary" and node.fields[2]:
                 left, right, *_ = node.fields
                 plan = ((0, False, left), (1, False, right))
@@ -644,15 +637,16 @@ class Checker:
         return binding
 
     def expression(self, node, flow, expected=None, *, transfer=False, consume=False,
-                   borrow_shared=False):
+                   borrow_shared=False, move_ordinary=False):
         checked = self.infer(node, flow, expected)
         actual = checked.type
         shared_borrow = borrow_shared and actual.shared and replace(actual, shared=False) == expected
-        if consume and actual.shared:
+        if consume and actual.is_shared:
             raise LanguageError(node.token, "own cannot consume a shared value")
         if not compatible(actual, expected) and not shared_borrow:
             raise LanguageError(node.token, f"expected {expected}, found {checked.type}")
-        if consume or (transfer and self.contains_exclusive(actual)):
+        if (consume or (move_ordinary and not actual.is_shared)
+                or (transfer and self.contains_exclusive(actual))):
             source = source_binding(node)
             if source is not None:
                 flow.move(node.token, source)
@@ -660,7 +654,7 @@ class Checker:
         if checked.call is not None:
             _, bindings = checked.call
             self.remember(checked.node, node.token, "call", checked.call)
-            if node.kind == "call":
+            if node.kind in {"call", "thread"}:
                 for argument, (_, _, reference) in zip(node.fields, bindings):
                     if reference is not None:
                         self.remember(checked.node, argument.expression.token, "local_reference", reference)
@@ -729,6 +723,8 @@ class Checker:
             return Checked(value_type, lowered)
         if kind == "call":
             return self.call(node, flow, expected)
+        if kind == "thread":
+            return self.start_thread(node, flow)
         if kind == "binary":
             operator = node.token.text
             if operator == "/":
@@ -860,6 +856,28 @@ class Checker:
         return builtin(operation, (("left", number), ("right", number)),
                        number if direct else result_type(number, OVERFLOW), GUARANTEES, group)
 
+    def start_thread(self, node, flow):
+        if self.current_function.modifiers & {"pure", "deterministic"}:
+            raise LanguageError(node.token, "a pure or deterministic function cannot start a thread")
+        capabilities = [name for name, binding in flow.bindings.items()
+                        if replace(binding.type, shared=False) == THREADS and name not in flow.moved]
+        if len(capabilities) != 1:
+            raise LanguageError(node.token, "thread requires exactly one visible threads capability")
+        name = node.token.text
+        task = self.functions.get(name) or self.imported_functions.get(name)
+        if task is None:
+            raise LanguageError(node.token, f"unknown task '{name}'")
+        if self.contains_exclusive(task.output):
+            raise LanguageError(node.token, "a task must return a shareable value")
+        for parameter in task.parameters:
+            if parameter.mutable:
+                raise LanguageError(node.token, "a task cannot accept mut arguments")
+            if self.contains_exclusive(parameter.type) and not parameter.owning:
+                raise LanguageError(node.token, f"exclusive task parameter '{parameter.name}' requires own")
+        call = self.bind_arguments(node, name, task, flow, starting=True)
+        lowered = Node(node.token, "thread", (*call.node.fields, capabilities[0]))
+        return Checked(Type("Thread", (task.output,)), lowered, call.call)
+
     def call(self, node, flow, expected, name=None):
         name = name or node.token.text
         arguments = node.fields
@@ -891,6 +909,9 @@ class Checker:
             if self.mock_header:
                 raise LanguageError(node.token, f"mock files cannot call live host function '{name}'")
             signature = HOST_FUNCTIONS[name]
+        if name in threads.OPERATIONS:
+            handle = self.type_hint((arg.expression for arg in arguments), flow, {"Thread"})
+            signature = threads.signature(node, handle)
         if name in GENERIC_FUNCTIONS:
             signature = self.generic_signature(name, arguments, flow, expected)
         if signature is None:
@@ -964,7 +985,7 @@ class Checker:
         flow.commit(trial)
         return value
 
-    def bind_arguments(self, node, name, signature, flow, *, transfer=False):
+    def bind_arguments(self, node, name, signature, flow, *, transfer=False, starting=False):
         arguments, parameters = node.fields, signature.parameters
         if len(arguments) != len(parameters):
             raise LanguageError(node.token, f"'{name}' expects {len(parameters)} arguments, got {len(arguments)}")
@@ -1008,7 +1029,8 @@ class Checker:
                 candidate = trial.copy()
                 try:
                     value = self.check_argument(argument, parameter, candidate,
-                                                transfer=transfer or name in {"at", "dropLast"})
+                                                transfer=transfer or name in {"at", "dropLast"},
+                                                starting=starting)
                 except LanguageError as failure:
                     if position > error_depth:
                         error, error_depth = failure, position
@@ -1041,15 +1063,16 @@ class Checker:
                                          for index, mutable, value in plan))
         return Checked(signature.output, Node(node.token, "invoke", (signature.key, plan, group)), call)
 
-    def check_argument(self, argument, parameter, flow, *, transfer=False):
+    def check_argument(self, argument, parameter, flow, *, transfer=False, starting=False):
         if argument.mutable != parameter.mutable:
             required = "requires" if parameter.mutable else "does not accept"
             raise LanguageError(argument.token, f"parameter '{parameter.name}' {required} a mut argument")
         if not argument.mutable:
             value = self.expression(argument.expression, flow, parameter.type,
                                     transfer=transfer, consume=parameter.owning,
-                                    borrow_shared=not (transfer or parameter.owning))
-            if not (transfer or parameter.owning) and self.contains_exclusive(value.type):
+                                    borrow_shared=not (starting or transfer or parameter.owning),
+                                    move_ordinary=starting)
+            if not (starting or transfer or parameter.owning) and self.contains_exclusive(value.type):
                 source = source_binding(argument.expression)
                 if source is not None:
                     if source in flow.write_loans:

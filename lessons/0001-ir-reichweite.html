@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Warum ein IR-Signal ankommt</title>
+  <link rel="stylesheet" href="../assets/teaching.css">
+  <script src="../assets/ir-model.js" defer></script>
+</head>
+<body>
+<main>
+  <header>
+    <div class="meta">IR-Optik · Erste Lektion · ca. 8 Minuten</div>
+    <h1>Warum ein IR-Signal ankommt</h1>
+    <p class="lead">Dein Tagger funktioniert im Schatten. In der Sonne verliert er bei gleichem Abstand Treffer. Was hat sich geändert? Nach dieser Lektion kannst du dafür drei mögliche Ursachen am Sender, im Lichtweg und am Empfänger auseinanderhalten.</p>
+  </header>
+
+  <section aria-labelledby="staerke">
+    <h2 id="staerke">Auf die Richtung kommt es an</h2>
+    <p>Die <strong>Strahlungsleistung</strong> in Milliwatt sagt, wie viel Lichtleistung die LED insgesamt abgibt. Die <strong>Strahlstärke</strong> in mW/sr sagt, wie viel davon in eine bestimmte Richtung geht. Der Empfänger bekommt davon eine <strong>Bestrahlungsstärke</strong> in mW/m² ab. Die Einheit Candela gewichtet sichtbares Licht nach dem menschlichen Auge. Für deinen IR-Link sind die radiometrischen Größen maßgeblich.</p>
+    <p>Im einfachen Modell trifft auf der Strahlachse bei doppeltem Abstand ein Viertel der Bestrahlungsstärke ein. Vierfache Strahlstärke in Empfängerrichtung ergibt bei gleicher Empfangsschwelle etwa doppelte Grenzdistanz. Das gilt im Fernfeld bei freier Sicht und festem Strahlprofil.</p>
+    <p class="formula"><strong>Signal am Empfänger</strong> ≈ Strahlstärke in seiner Richtung ÷ Abstand²</p>
+    <p class="sources"><a href="https://www.vishay.com/docs/80073/general.pdf#page=1">Vishay · IR-Übertragung, Abb. 1–2</a></p>
+  </section>
+
+  <section aria-labelledby="empfang">
+    <h2 id="empfang">940 nm, 38 kHz und Sonnenlicht</h2>
+    <p><strong>940 nm</strong> ist die Wellenlänge, bei der deine TSAL6200 am stärksten abstrahlt. Der TSOP38238 ist in diesem Bereich empfindlich. Bei derselben abgestrahlten Leistung kann eine andere Wellenlänge stärker oder schwächer ankommen, weil Empfänger, Filter und Optik je nach Wellenlänge unterschiedlich reagieren.</p>
+    <p><strong>38 kHz</strong> beschreibt, wie schnell die LED während eines Signalpakets ein- und ausgeschaltet wird. Stell dir eine rote Lampe vor, die blinkt. Rot entspricht der Wellenlänge, die Blinkrate der Modulation. Der Empfänger wertet Gruppen solcher Pulse aus.</p>
+    <p><strong>Tageslicht enthält ebenfalls nahes Infrarot.</strong> Der 38-kHz-Filter hilft, weitgehend gleichmäßiges Hintergrundlicht vom Nutzsignal zu unterscheiden. Das Hintergrundlicht trifft trotzdem auf die Fotodiode. Es erhöht das Rauschen, und die automatische Verstärkungsregelung kann die Empfindlichkeit senken. Die benötigte Signalstärke steigt. Darum kann bereits die Sonneneinstrahlung <em>am Empfänger</em> die Trefferquote verändern, während der Sender gleich bleibt. Lux beschreibt die sichtbare Helligkeit. Die IR-Belastung des Empfängers lässt sich daraus allein kaum ableiten.</p>
+    <p class="sources"><a href="https://www.vishay.com/docs/81010/tsal6200.pdf">Vishay · TSAL6200</a> · <a href="https://wwwlegacy.vishay.com/docs/82491/tsop382.pdf#page=4">Vishay · TSOP382, Abb. 5, 6 und 10</a> · <a href="https://www.vishay.com/docs/82904/irreceiversprecencesensorapps.pdf">Vishay · Empfänger und automatische Verstärkung</a></p>
+  </section>
+
+  <section class="model" data-ir-model aria-labelledby="modell">
+    <h2 id="modell">Probier das Schwellenmodell aus</h2>
+    <p>Verdopple zuerst den Abstand. Sage voraus, was mit dem Signal passiert, bevor du die Auswahl änderst. Stelle danach die Ursprungslage wieder her und vervierfache nur die Schwelle.</p>
+    <div class="controls">
+      <label>Strahlstärke <select name="power"><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
+      <label>Abstand <select name="distance"><option value="0.5">0,5×</option><option value="1" selected>1×</option><option value="1.5">1,5×</option><option value="2">2×</option></select></label>
+      <label>Empfangsschwelle <select name="threshold"><option value="1" selected>1× · Referenz</option><option value="2">2× · mehr Störung</option><option value="4">4× · viel Störung</option></select></label>
+    </div>
+    <output aria-live="polite">Signal 1 · Schwelle 1 · Gerade an der Schwelle.</output>
+    <div class="meter"><span>Signal</span><meter data-signal min="0" max="16" value="1" aria-label="Relatives Signal"></meter></div>
+    <div class="meter"><span>Schwelle</span><meter data-threshold min="0" max="16" value="1" aria-label="Relative Empfangsschwelle"></meter></div>
+    <p class="meta">Alle Werte beziehen sich auf eine gedachte Referenz. Die Störstufen stehen für angenommene Schwellen im Lernmodell. Wie hoch die Schwelle in echter Sonne ist, hängt von der Messsituation ab.</p>
+    <noscript><p>Mit JavaScript reagieren die Regler. Von Hand ergibt doppelter Abstand aus Signal 1 den Wert 0,25. Vierfache Schwelle bei Ausgangsabstand ergibt ebenfalls ein Signal-Schwellen-Verhältnis von 0,25.</p></noscript>
+  </section>
+
+  <section aria-labelledby="linsen">
+    <h2 id="linsen">Was eine Linse mit dem Licht macht</h2>
+    <p>Eine Sammellinse <strong>erfasst einen Teil der LED-Strahlung</strong> und lenkt ihn um. Nahe der Brennebene kann sie den Lichtkegel enger machen. Mehr Strahlstärke auf der Achse bedeutet dann weniger Abdeckung seitlich. Wie viel Licht die Linse überhaupt erfasst, hängt von ihrer freien Öffnung, ihrem Abstand und dem Abstrahlwinkel der LED ab. Die LED hat eine endliche leuchtende Fläche, deshalb bleibt auch bei guter Einstellung eine Restaufweitung.</p>
+    <p>Bei deiner <strong>OM12 mit 25 mm Nenndurchmesser und 45 mm Brennweite</strong> lohnt es sich, zwei Fragen getrennt zu stellen. Wie viel Licht erreicht die freie Öffnung? Wie breit verteilt es sich danach? Eine größere Linse mit viel längerer Brennweite kann weiter von der LED entfernt stehen und dadurch einen kleineren Winkel erfassen, als ihr Durchmesser vermuten lässt.</p>
+    <p class="sources"><a href="https://astromedia.de/OptiMedia-Acrylglas-Linse-OM12">AstroMedia · OM12</a> · <a href="https://www.edmundoptics.com/knowledge-center/application-notes/optics/considerations-in-collimation/">Edmund Optics · Quellgröße und erfasste Leistung</a></p>
+  </section>
+
+  <section aria-labelledby="mehrere">
+    <h2 id="mehrere">Zwei Linsen verändern einander</h2>
+    <p><strong>Dicht beieinander</strong> addieren sich bei dünnen Linsen näherungsweise die Brechkräfte, also die Kehrwerte der Brennweiten. Zwei Sammellinsen mit je 60 mm ergeben zusammen ungefähr 30 mm. Behältst du dabei den alten LED-Abstand bei, ändert sich die Strahlform.</p>
+    <p><strong>Mit Abstand</strong> sieht die zweite Linse den Strahlenverlauf, den die erste erzeugt hat. Nimm dieselben zwei 60-mm-Linsen und setze sie 120 mm auseinander. Parallel einfallende Strahlen treffen sich dann in der Mitte. Dieser Punkt liegt zugleich in der vorderen Brennebene der zweiten Linse, deshalb treten die Strahlen im idealisierten Modell wieder parallel aus. Das ist das Grundprinzip eines einfachen Teleskops. Zusätzliche Flächen und begrenzte Öffnungen können Licht kosten.</p>
+    <p class="sources"><a href="https://openstax.org/books/university-physics-volume-3/pages/2-5-the-eye">OpenStax · Addition der Brechkräfte</a> · <a href="https://openstax.org/books/university-physics-volume-3/pages/2-8-microscopes-and-telescopes">OpenStax · Getrennte Linsen am Mikroskop</a></p>
+  </section>
+
+  <section aria-labelledby="fragen">
+    <h2 id="fragen">Kurz aus dem Kopf</h2>
+    <p>Formuliere deine Antwort, bevor du die Lösung öffnest.</p>
+    <details><summary>Der Empfänger braucht viermal so viel Signal. Was passiert mit der Grenzdistanz?</summary><p>Sie halbiert sich im Modell. Auf halber Distanz kommt viermal so viel an. Probiere im Modell Schwelle 4× und Abstand 0,5×.</p></details>
+    <details><summary>Die LED hat weiterhin 940 nm, die Ansteuerung wechselt auf 56 kHz. Was ändert sich?</summary><p>Der Empfänger sieht weiterhin die passende IR-Wellenlänge, aber die Pulsrate passt schlechter zu seinem 38-kHz-Bandpass.</p></details>
+    <details><summary>Zwei gleiche Sammellinsen liegen dicht zusammen. Wird die Brennweite länger oder kürzer?</summary><p>Sie wird ungefähr halb so lang. Bei dünnen Linsen addieren sich die Kehrwerte der Brennweiten.</p></details>
+    <p>Versuche morgen, die drei Antworten noch einmal ohne Nachschlagen zu geben.</p>
+  </section>
+
+  <footer>
+    <p>Wenn du nur eine Quelle liest, beginne mit den ersten beiden Abbildungen in <a href="https://www.vishay.com/docs/80073/general.pdf#page=1">Vishays Überblick zur IR-Übertragung</a>.</p>
+    <p>Frag mich nach, wenn ein Zusammenhang noch hakt. Nenne gern deine Vorhersage aus dem Modell, dann können wir sie gemeinsam prüfen.</p>
+    <nav aria-label="Lernmaterial"><a href="../reference/ir-reichweite.html">Merkblatt zur IR-Reichweite</a> · <a href="../RESOURCES.md">Quellenübersicht</a></nav>
+  </footer>
+</main>
+</body>
+</html>

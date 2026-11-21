@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IR-Reichweite · Merkblatt</title>
+  <link rel="stylesheet" href="../assets/teaching.css">
+</head>
+<body>
+<main>
+  <header>
+    <p class="meta">IR-Optik · Merkblatt</p>
+    <h1>IR-Reichweite</h1>
+    <p class="lead">Ein Signal wird erkennbar, wenn am Empfänger genug modulierte Strahlung im passenden Wellenlängenbereich ankommt.</p>
+  </header>
+
+  <h2>Größen auseinanderhalten</h2>
+  <table>
+    <thead><tr><th scope="col">Größe</th><th scope="col">Einheit</th><th scope="col">Frage</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">Strahlungsleistung</th><td>mW</td><td>Wie viel optische Leistung strahlt die Quelle insgesamt ab?</td></tr>
+      <tr><th scope="row">Strahlstärke</th><td>mW/sr</td><td>Wie viel davon geht in die Richtung des Empfängers?</td></tr>
+      <tr><th scope="row">Bestrahlungsstärke</th><td>mW/m²</td><td>Wie viel davon kommt pro Fläche am Empfänger an?</td></tr>
+      <tr><th scope="row">Wellenlänge</th><td>nm</td><td>Wo liegt das Spektrum der LED? Bei der TSAL6200 liegt das Maximum bei 940 nm.</td></tr>
+      <tr><th scope="row">Modulationsfrequenz</th><td>kHz</td><td>Wie schnell pulst das Licht in einem Burst? Der TSOP38238 ist für 38 kHz ausgelegt.</td></tr>
+    </tbody>
+  </table>
+  <p class="sources"><a href="https://www.vishay.com/docs/80073/general.pdf">Vishay · IR-Übertragung</a> · <a href="https://www.vishay.com/docs/81010/tsal6200.pdf">TSAL6200</a> · <a href="https://wwwlegacy.vishay.com/docs/82491/tsop382.pdf#page=4">TSOP382</a></p>
+
+  <h2>Überschlag im Fernfeld</h2>
+  <p class="formula">Bestrahlungsstärke ≈ Strahlstärke ÷ Abstand²<br>Grenzdistanz ∝ √(Strahlstärke ÷ Empfangsschwelle)</p>
+  <p>Doppelter Abstand ergibt ein Viertel des Signals. Vierfache Strahlstärke in Empfängerrichtung ergibt doppelte Grenzdistanz, sofern die Schwelle gleich bleibt. Vierfache Schwelle ergibt halbe Grenzdistanz, sofern der Sender gleich bleibt. Das Modell setzt freie Sicht, ein festes Strahlprofil und eine feste Empfängerausrichtung voraus.</p>
+
+  <h2>Linsen und Tageslicht</h2>
+  <ul>
+    <li>Bei einer <strong>einzelnen Linse</strong> bestimmen Durchmesser und Abstand mit, wie viel Licht die freie Öffnung erfasst. Die Strahlform hängt auch von der Brennweite, der Quellgröße und der Position der LED ab. <a href="https://www.edmundoptics.com/knowledge-center/application-notes/optics/considerations-in-collimation/">Edmund Optics</a></li>
+    <li>Bei <strong>mehreren dünnen Linsen</strong> dicht beieinander addieren sich die Kehrwerte der Brennweiten. Bei getrennten Linsen wird das Zwischenbild der ersten Linse zum Objekt für die zweite. <a href="https://openstax.org/books/university-physics-volume-3/pages/2-5-the-eye">OpenStax · Nahe Linsen</a> · <a href="https://openstax.org/books/university-physics-volume-3/pages/2-8-microscopes-and-telescopes">OpenStax · Getrennte Linsen</a></li>
+    <li><strong>Nahes IR im Tageslicht</strong> kann die Empfangsschwelle erhöhen. Der Filter für die Modulationsfrequenz unterdrückt den weitgehend gleichmäßigen Anteil im elektrischen Signal. Die Fotodiode wird weiterhin vom Umgebungslicht beleuchtet. <a href="https://wwwlegacy.vishay.com/docs/82491/tsop382.pdf#page=4">Vishay · Empfindlichkeit bei hellem Umgebungslicht</a></li>
+  </ul>
+
+  <footer><nav aria-label="Lernmaterial"><a href="../lessons/0001-ir-reichweite.html">Zur Lektion und zum interaktiven Modell</a> · <a href="../RESOURCES.md">Quellenübersicht</a></nav></footer>
+</main>
+</body>
+</html>

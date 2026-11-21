@@ -48,6 +48,10 @@ class Type:
             units += "/" + "/".join(denominator)
         return f"{name}<{units}>"
 
+    @property
+    def is_shared(self):
+        return self.shared or (self.module is None and self.name in SHARED_HANDLES)
+
     def without_refinement(self):
         return replace(self, nonzero=False)
 
@@ -68,7 +72,12 @@ UNIT = Type("unit")
 CONSOLE = Type("console")
 FILESYSTEM = Type("filesystem")
 RANDOM = Type("random")
-CAPABILITIES = {capability.name: capability for capability in (CONSOLE, FILESYSTEM, RANDOM)}
+THREADS = Type("threads")
+MOCK_CAPABILITIES = {capability.name: capability for capability in (CONSOLE, FILESYSTEM, RANDOM)}
+CAPABILITIES = {**MOCK_CAPABILITIES, THREADS.name: THREADS}
+SHARED_HANDLES = {"Thread"}
+GENERIC_TYPES = {"list": 1, "result": 2, "Thread": 1}
+KILLED = Type("Killed")
 RANDOM_DRAW = Type("RandomDraw")
 OVERFLOW = Type("Overflow")
 ZERO = Type("Zero")
@@ -77,14 +86,16 @@ HOST_ERROR = Type("HostError")
 HOST_ERROR_KIND = Type("HostErrorKind")
 PARSE_INT_ERROR = Type("ParseIntError")
 EXAMPLE_ERROR_MESSAGES = {
-    OVERFLOW.name: False, ZERO.name: False, INDEX_ERROR.name: True, PARSE_INT_ERROR.name: True,
+    KILLED.name: False, OVERFLOW.name: False, ZERO.name: False, INDEX_ERROR.name: True, PARSE_INT_ERROR.name: True,
 }
 GUARANTEES = frozenset({"ending", "deterministic", "pure"})
 MODIFIERS = GUARANTEES | {"commutative"}
-SIMPLE_TYPES = {
-    item.name for item in (BOOL, STRING, UNIT, CONSOLE, FILESYSTEM, RANDOM, RANDOM_DRAW,
-                           OVERFLOW, ZERO, INDEX_ERROR, HOST_ERROR, HOST_ERROR_KIND, PARSE_INT_ERROR)
-}
+SIMPLE_TYPES = (
+    CAPABILITIES.keys() | {
+        item.name for item in (BOOL, STRING, UNIT, RANDOM_DRAW, KILLED,
+                               OVERFLOW, ZERO, INDEX_ERROR, HOST_ERROR, HOST_ERROR_KIND, PARSE_INT_ERROR)
+    }
+)
 
 
 def result_type(value, error):
@@ -161,6 +172,15 @@ class Function:
             return frozenset()
         return frozenset(index for index, parameter in enumerate(self.parameters)
                          if not self.commutative or parameter.name in self.commutative)
+
+
+def builtin(name, parameters, output, modifiers=frozenset(), commutative=()):
+    if commutative:
+        modifiers = modifiers | {"commutative"}
+    return Function(Token(name, 0, 0), modifiers, tuple(
+        Parameter(Token(label, 0, 0), parameter_type)
+        for label, parameter_type in parameters
+    ), output, commutative=commutative)
 
 
 @dataclass(frozen=True)
@@ -289,7 +309,7 @@ class Parser:
     def mock_header(self):
         if self.accept("mock"):
             environment = self.name()
-            if environment.text not in CAPABILITIES:
+            if environment.text not in MOCK_CAPABILITIES:
                 raise LanguageError(environment, f"unknown mock environment '{environment.text}'")
             self.mock = environment
             if self.comments is not None:
@@ -401,18 +421,14 @@ class Parser:
             raise LanguageError(token, f"mock files cannot use host capability type '{name}'")
         if name in SIMPLE_TYPES:
             return Type(name, shared=bool(shared))
-        if name == "list":
+        if name in GENERIC_TYPES:
             self.type_angle("<")
-            element = self.type()
+            arguments = [self.type()]
+            for _ in range(GENERIC_TYPES[name] - 1):
+                self.expect(",")
+                arguments.append(self.type())
             self.type_angle(">")
-            return Type(name, (element,))
-        if name == "result":
-            self.type_angle("<")
-            value = self.type()
-            self.expect(",")
-            error = self.type()
-            self.type_angle(">")
-            return result_type(value, error)
+            return Type(name, tuple(arguments))
         if name == "Uint32":
             name = UINT.name
         if name in INTEGER_BOUNDS or name == "f64":
@@ -549,6 +565,11 @@ class Parser:
             return Node(token, "value", (token.text == "true", BOOL))
         if token.text == "unit":
             return Node(token, "value", (None, UNIT))
+        if token.text == "thread" and self.current.kind == "name":
+            task = self.primary()
+            if task.kind != "call":
+                raise LanguageError(token, "thread requires a named task call")
+            return replace(task, kind="thread")
         if token.kind == "name" and token.text not in RESERVED:
             if (self.current.text == "." and self.index + 2 < len(self.tokens)
                     and self.tokens[self.index + 2].text in {"(", "::"}):
