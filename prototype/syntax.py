@@ -57,6 +57,11 @@ class Type:
 
 BOOL = Type("bool")
 INT = Type("int32")
+UINT = Type("uint32")
+INTEGER_BOUNDS = {
+    INT.name: (-(2**31), 2**31 - 1),
+    UINT.name: (0, 2**32 - 1),
+}
 FLOAT = Type("f64")
 STRING = Type("string")
 UNIT = Type("unit")
@@ -408,10 +413,12 @@ class Parser:
             error = self.type()
             self.type_angle(">")
             return result_type(value, error)
-        if name in {"int32", "f64"}:
+        if name == "Uint32":
+            name = UINT.name
+        if name in INTEGER_BOUNDS or name == "f64":
             nonzero = self.accept("!0")
             if name == "f64" and nonzero:
-                raise LanguageError(nonzero, "only int32 supports !0 in this prototype")
+                raise LanguageError(nonzero, "only integer types support !0")
             units = ()
             if self.current.text == "<":
                 self.type_angle("<")
@@ -534,7 +541,7 @@ class Parser:
                 raise LanguageError(digits, "expected a numeric literal after '-'")
             value = digits.text.lstrip("0") or "0"
             if len(value) > 10:
-                raise LanguageError(token, "integer literal is outside the int32 range")
+                raise LanguageError(token, "integer literal is outside the supported 32-bit range")
             return Node(token, "integer", (-int(value) if negative else int(value),))
         if token.kind == "string":
             return Node(token, "value", (decode_string(token), STRING))

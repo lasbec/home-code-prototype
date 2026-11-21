@@ -12,7 +12,7 @@ from tempfile import NamedTemporaryFile
 from time import monotonic
 
 from .checker import HOST_FUNCTIONS
-from .syntax import EXAMPLE_ERROR_MESSAGES
+from .syntax import EXAMPLE_ERROR_MESSAGES, INTEGER_BOUNDS
 
 try:
     import termios
@@ -247,8 +247,9 @@ def replace_file(filesystem, path, text):
         return Result("Err", Failure("WriteError", str(error)))
 
 
-def checked_int(value):
-    if -(2**31) <= value < 2**31:
+def checked_int(value, integer="int32"):
+    lower, upper = INTEGER_BOUNDS[integer]
+    if lower <= value <= upper:
         return Result("Ok", value)
     return Result("Err", Failure("Overflow"))
 
@@ -302,6 +303,9 @@ BUILTINS = {
     "pseudoRandom": pseudo_random,
     "add": lambda left, right: checked_int(left + right),
     "subtract": lambda left, right: checked_int(left - right),
+    "uint32:add": lambda left, right: checked_int(left + right, "uint32"),
+    "uint32:subtract": lambda left, right: checked_int(left - right, "uint32"),
+    "toUint32": lambda value: checked_int(value, "uint32"),
     "min": min,
     "max": max,
     "nonzero": nonzero,
@@ -315,8 +319,7 @@ BUILTINS = {
     "hostErrorKind": host_error_kind,
     "describeHostError": lambda error: display(error),
 }
-OPERATORS = {"==": eq, "!=": ne, "<": lt, ">": gt, "<=": le, ">=": ge, "/": truediv,
-             "*": lambda left, right: checked_int(left * right)}
+OPERATORS = {"==": eq, "!=": ne, "<": lt, ">": gt, "<=": le, ">=": ge, "/": truediv}
 
 
 class Interpreter:
@@ -433,9 +436,12 @@ class Interpreter:
             value, index = fields
             return self.expression(value, environment).fields[index][1]
         if kind == "binary":
-            left, right, _ = fields
-            return OPERATORS[node.token.text](self.expression(left, environment),
-                                              self.expression(right, environment))
+            left, right, _, *integer = fields
+            first = self.expression(left, environment)
+            second = self.expression(right, environment)
+            if node.token.text == "*":
+                return checked_int(first * second, integer[0])
+            return OPERATORS[node.token.text](first, second)
         if kind == "invoke":
             name, plan, _ = fields
             return self.call(name, self.arguments(plan, environment))

@@ -5,8 +5,8 @@ from dataclasses import dataclass, field, replace
 
 from .syntax import (
     BOOL, CAPABILITIES, CONSOLE, EXAMPLE_ERROR_MESSAGES, FILESYSTEM, FLOAT, GUARANTEES, HOST_ERROR,
-    HOST_ERROR_KIND, INDEX_ERROR, INT, OVERFLOW, PARSE_INT_ERROR, RANDOM, RANDOM_DRAW, SIMPLE_TYPES,
-    STRING, UNIT, ZERO, Argument, EnumDeclaration, Function, LanguageError, Node, Parameter,
+    HOST_ERROR_KIND, INDEX_ERROR, INT, INTEGER_BOUNDS, OVERFLOW, PARSE_INT_ERROR, RANDOM, RANDOM_DRAW, SIMPLE_TYPES,
+    STRING, UINT, UNIT, ZERO, Argument, EnumDeclaration, Function, LanguageError, Node, Parameter,
     RecordDeclaration, Token, Type, product_units, quotient_units, result_type,
 )
 
@@ -53,7 +53,7 @@ PURE_FUNCTIONS = {
                 RANDOM_DRAW, GUARANTEES, ("bound0", "bound1")),
     )
 }
-GENERIC_FUNCTIONS = {"add", "subtract", "min", "max", "nonzero", "at", "prepend", "dropLast"}
+GENERIC_FUNCTIONS = {"add", "subtract", "min", "max", "nonzero", "at", "prepend", "dropLast", "toUint32"}
 CONSTRUCTORS = {"Ok", "Err"}
 BUILTIN_NAMES = HOST_FUNCTIONS.keys() | PURE_FUNCTIONS.keys() | GENERIC_FUNCTIONS | CONSTRUCTORS
 LITERAL_VALUE_KINDS = {"value", "integer", "decimal", "list", "variant", "call"}
@@ -206,7 +206,7 @@ class Checker:
             })
         self.current_function = None
         used_names = (BUILTIN_NAMES - self.mock_operations.keys()) | {RANDOM_DRAW.name}
-        builtin_types = SIMPLE_TYPES | {"int32", "f64", "result", "list"}
+        builtin_types = SIMPLE_TYPES | INTEGER_BOUNDS.keys() | {"Uint32", "f64", "result", "list"}
         for declaration in declarations:
             token = declaration.token
             name = token.text
@@ -454,7 +454,7 @@ class Checker:
             if node.kind == "invoke":
                 _, plan, destinations = node.fields
             elif node.kind == "binary" and node.fields[2]:
-                left, right, _ = node.fields
+                left, right, *_ = node.fields
                 plan = ((0, False, left), (1, False, right))
                 destinations = {0, 1}
             else:
@@ -678,9 +678,10 @@ class Checker:
             return Checked(value_type, Node(node.token, kind, (value,)))
         if kind == "integer":
             value, = fields
-            if not -(2**31) <= value < 2**31:
-                raise LanguageError(node.token, "integer literal is outside the int32 range")
-            base = expected.without_refinement() if expected and expected.name == "int32" else INT
+            base = expected.without_refinement() if expected and expected.name in INTEGER_BOUNDS else INT
+            lower, upper = INTEGER_BOUNDS[base.name]
+            if not lower <= value <= upper or (base.name == UINT.name and node.token.text == "-"):
+                raise LanguageError(node.token, f"integer literal is outside the {base.name} range")
             return Checked(base.refined() if value else base, Node(node.token, "value", (value,)))
         if kind == "decimal":
             value_type = expected if expected and expected.name == "f64" else FLOAT
@@ -736,7 +737,7 @@ class Checker:
                 arguments = tuple(Argument(operand.token, operand) for operand in fields)
                 return self.call(Node(node.token, "call", arguments), flow, expected, name="add")
             if operator == "*":
-                return self.multiplication(node, flow)
+                return self.multiplication(node, flow, expected)
             return self.comparison(node, flow)
         raise AssertionError(kind)
 
@@ -753,7 +754,7 @@ class Checker:
         values = [self.expression(item, flow, element, transfer=True).node for item in node.fields]
         return Checked(Type("list", (element,)), Node(node.token, "list", tuple(values)))
 
-    def type_hint(self, nodes, flow, type_name=None):
+    def type_hint(self, nodes, flow, names=None):
         for node in nodes:
             if node.kind == "integer":
                 continue
@@ -761,51 +762,57 @@ class Checker:
                 inferred = self.expression(node, flow.copy()).type
             except LanguageError:
                 continue
-            if type_name is None or inferred.name == type_name:
+            if names is None or inferred.name in names:
                 return inferred
         return None
 
     def comparison(self, node, flow):
         left_node, right_node = node.fields
         equality = node.token.text in {"==", "!="}
-        hint = self.type_hint(node.fields, flow, None if equality else "int32") or INT
+        hint = self.type_hint(node.fields, flow, None if equality else INTEGER_BOUNDS) or INT
         base = hint.without_refinement()
-        if base.name != "int32" and base not in {STRING, BOOL}:
+        if base.name not in INTEGER_BOUNDS and base not in {STRING, BOOL}:
             variants = self.enums.get(base)
             if variants is None or any(payload is not None for payload in variants.values()):
                 raise LanguageError(node.token, f"comparison is unavailable for {base}")
         left = self.expression(left_node, flow, base)
         right = self.expression(right_node, flow, base)
-        commutative = equality and base.name == "int32"
+        commutative = equality and base.name in INTEGER_BOUNDS
         return Checked(BOOL, Node(node.token, "binary", (left.node, right.node, commutative)))
 
-    def multiplication(self, node, flow):
-        operands = [self.expression(operand, flow) for operand in node.fields]
-        for operand in operands:
-            if operand.type.name != "int32":
-                raise LanguageError(operand.node.token, f"multiplication expects int32, found {operand.type}")
-        left, right = operands
-        number = Type("int32", units=product_units(left.type.units, right.type.units))
+    def multiplication(self, node, flow, expected):
+        hint = self.type_hint(node.fields, flow, INTEGER_BOUNDS)
+        if hint is None and expected and expected.name == "result":
+            hint = expected.arguments[0]
+        scalar = UINT if hint and hint.name == UINT.name else INT
+        left, right = (
+            self.expression(operand, flow, scalar if operand.kind == "integer" else None)
+            for operand in node.fields
+        )
+        if left.type.name != scalar.name or right.type.name != scalar.name:
+            raise LanguageError(node.token, f"multiplication expects two {scalar.name} operands")
+        number = Type(scalar.name, units=product_units(left.type.units, right.type.units))
         return Checked(result_type(number, OVERFLOW),
-                       Node(node.token, "binary", (left.node, right.node, True)))
+                       Node(node.token, "binary", (left.node, right.node, True, scalar.name)))
 
     def division(self, node, flow, annotation):
         if annotation.name != "f64":
             raise LanguageError(node.token, "division requires an explicit f64 result type")
         numerator, divisor = node.fields
         # The annotation and either operand can supply units for a bare literal.
-        actual = [self.type_hint((expression,), flow, "int32") for expression in node.fields]
+        actual = [self.type_hint((expression,), flow, INTEGER_BOUNDS) for expression in node.fields]
+        integer = next((value.name for value in actual if value is not None), INT.name)
         left_units = actual[0].units if actual[0] else ()
         right_units = actual[1].units if actual[1] else ()
         if actual[0] is None and numerator.kind == "integer":
             left_units = quotient_units(annotation.units, quotient_units((), right_units))
         elif actual[1] is None and divisor.kind == "integer":
             right_units = quotient_units(left_units, annotation.units)
-        left = self.expression(numerator, flow, Type("int32", units=left_units))
+        left = self.expression(numerator, flow, Type(integer, units=left_units))
         try:
-            right = self.expression(divisor, flow, Type("int32", units=right_units, nonzero=True))
+            right = self.expression(divisor, flow, Type(integer, units=right_units, nonzero=True))
         except LanguageError as error:
-            if str(error).startswith("expected int32!0"):
+            if str(error).startswith(f"expected {integer}!0"):
                 raise LanguageError(
                     error.token,
                     f"division needs a proven nonzero divisor ({error}); use 'if value != 0' or nonzero(value)",
@@ -821,7 +828,7 @@ class Checker:
     def generic_signature(self, name, arguments, flow, expected):
         if name in {"at", "dropLast"}:
             items = self.type_hint(
-                (arg.expression for arg in arguments if arg.label in {None, "items"}), flow, "list"
+                (arg.expression for arg in arguments if arg.label in {None, "items"}), flow, {"list"}
             )
             if name == "at" and items is None and expected and expected.name == "result":
                 items = Type("list", (expected.arguments[0],))
@@ -833,18 +840,24 @@ class Checker:
                 return builtin(name, (("items", items),), items, GUARANTEES)
             return builtin(name, (("items", items), ("index", INT)),
                            result_type(items.arguments[0], INDEX_ERROR), GUARANTEES)
-        hint = self.type_hint((arg.expression for arg in arguments), flow, "int32")
-        if hint is None and name in {"min", "max"} and expected and expected.name == "int32":
-            hint = expected
-        if hint is None and expected and expected.name == "result":
-            if expected.arguments[0].name == "int32":
-                hint = expected.arguments[0]
-        number = (hint or INT).without_refinement()
+        values = (arg.expression for arg in arguments)
+        if name == "toUint32":
+            source = self.type_hint(values, flow, {INT.name})
+            if source is None and expected and expected.name == "result":
+                source = expected.arguments[0]
+            units = source.units if source else ()
+            return builtin(name, (("value", Type(INT.name, units=units)),),
+                           result_type(Type(UINT.name, units=units), OVERFLOW), GUARANTEES)
+        hint = self.type_hint(values, flow, INTEGER_BOUNDS)
+        if hint is None and expected:
+            hint = expected.arguments[0] if expected.name == "result" else expected
+        number = hint.without_refinement() if hint and hint.name in INTEGER_BOUNDS else INT
         if name == "nonzero":
             return builtin(name, (("value", number),), result_type(number.refined(), ZERO), GUARANTEES)
         direct = name in {"min", "max"}
         group = () if name == "subtract" else ("left", "right")
-        return builtin(name, (("left", number), ("right", number)),
+        operation = f"uint32:{name}" if not direct and number.name == UINT.name else name
+        return builtin(operation, (("left", number), ("right", number)),
                        number if direct else result_type(number, OVERFLOW), GUARANTEES, group)
 
     def call(self, node, flow, expected, name=None):
@@ -1023,7 +1036,8 @@ class Checker:
         flow.commit(resolved)
         call = None
         if self.facts is not None:
-            call = (signature.key, tuple((parameters[index].name, mutable, value if mutable else None)
+            call = (name if signature.name.startswith("uint32:") else signature.key,
+                    tuple((parameters[index].name, mutable, value if mutable else None)
                                          for index, mutable, value in plan))
         return Checked(signature.output, Node(node.token, "invoke", (signature.key, plan, group)), call)
 

@@ -7,10 +7,10 @@ color brightcyan "\<(commutative|deterministic|pure|ending)\>"
 # Highlight example entries while leaving calls such as input(console) alone.
 color brightcyan "\<(example|expect)\>" "\<(input|after)\>[[:blank:]]"
 
-color brightmagenta "\<(bool|console|f64|filesystem|int32|list|random|result|string|unit)\>"
+color brightmagenta "\<(bool|console|f64|filesystem|int32|list|random|result|string|uint32|Uint32|unit)\>"
 color brightmagenta "\<(HostError|HostErrorKind|IndexError|Overflow|ParseIntError|RandomDraw|Zero)\>"
 color brightyellow "\<(false|true)\>" "(-|\<)[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?\>"
-color brightmagenta "\<int32!0\>"
+color brightmagenta "\<(int32|uint32|Uint32)!0\>"
 
 color brightgreen "\"([^\"\\]|\\.)*\""
 # Match paired quotes after // so URLs inside strings retain their color.
