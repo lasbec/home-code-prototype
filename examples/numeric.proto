@@ -1,12 +1,32 @@
 // Unordered call arguments, units, nonzero evidence, and checked arithmetic.
+example "distance per second" {
+    input elapsed: 2;
+    input distance: -7;
+    expect -3.5;
+}
 pure deterministic terminates fn speed(elapsed: int32!0<seconds>, distance: int32<meter>) -> f64<meter/seconds> {
     return distance / elapsed as f64<meter/seconds>;
 }
 
+example "sets the duration to three seconds" {
+    input elapsed: 5;
+    expect unit;
+    after elapsed: 3;
+}
 deterministic terminates fn setDuration(elapsed: mut int32!0<seconds>) -> unit {
     elapsed = 3;
 }
 
+example "adds durations" {
+    input a: 2;
+    input b: 3;
+    expect Ok(5);
+}
+example "reports overflow" {
+    input a: 2147483647;
+    input b: 1;
+    expect Err(Overflow());
+}
 pure deterministic terminates commutative fn total(a: int32<seconds>, b: int32<seconds>) -> result<int32<seconds>, Overflow> {
     return a + b;
 }

@@ -15,11 +15,40 @@ def terminate(signum, _frame):
     raise SystemExit(128 + signum)
 
 
+def run_examples(source, program):
+    interpreter = Interpreter(program)
+    passed = failed = 0
+    for function in program.values():
+        for example in function.examples:
+            token = example.token
+            location = f"{source}:{token.line}:{token.column}"
+            label = f"example for '{function.name}'"
+            if example.description is not None:
+                label += f" {display(example.description, literal=True)}"
+            try:
+                mismatches = list(interpreter.example_mismatches(function, example))
+            except RecursionError:
+                print(f"{location}: {label}: interpreter reached its call stack limit", file=sys.stderr)
+                failed += 1
+                continue
+            if mismatches:
+                failed += 1
+                for subject, expected, actual in mismatches:
+                    print(f"{location}: {label}: {subject}: expected {display(expected, literal=True)}, "
+                          f"got {display(actual, literal=True)}", file=sys.stderr)
+            else:
+                passed += 1
+    print(f"{passed} passed, {failed} failed ({passed + failed} total)")
+    return int(failed > 0)
+
+
 def main():
-    cli = argparse.ArgumentParser(description="Check or run a program in the language prototype.")
+    cli = argparse.ArgumentParser(description="Check, test, or run a program in the language prototype.")
     commands = cli.add_subparsers(dest="command", required=True)
     check = commands.add_parser("check", help="validate a source file without running it")
     check.add_argument("source", type=Path)
+    test = commands.add_parser("test", help="validate and run attached examples")
+    test.add_argument("source", type=Path)
     run = commands.add_parser("run", help="validate and run main")
     run.add_argument("source", type=Path)
     run.add_argument("--console", action="store_true", help="pass live standard input and output")
@@ -39,6 +68,11 @@ def main():
     if args.command == "check":
         print(f"{args.source}: OK")
         return 0
+    if args.command == "test":
+        try:
+            return run_examples(args.source, program)
+        except KeyboardInterrupt:
+            return 130
 
     entry = program.get("main")
     if entry is None:

@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 import json
+import math
 import re
 
 
@@ -48,6 +49,7 @@ class Type:
 
 BOOL = Type("bool")
 INT = Type("int32")
+FLOAT = Type("f64")
 STRING = Type("string")
 UNIT = Type("unit")
 CONSOLE = Type("console")
@@ -60,6 +62,9 @@ INDEX_ERROR = Type("IndexError")
 HOST_ERROR = Type("HostError")
 HOST_ERROR_KIND = Type("HostErrorKind")
 PARSE_INT_ERROR = Type("ParseIntError")
+EXAMPLE_ERROR_MESSAGES = {
+    OVERFLOW.name: False, ZERO.name: False, INDEX_ERROR.name: True, PARSE_INT_ERROR.name: True,
+}
 GUARANTEES = frozenset({"terminates", "deterministic", "pure"})
 MODIFIERS = GUARANTEES | {"commutative"}
 SIMPLE_TYPES = {
@@ -102,6 +107,20 @@ class Parameter:
 
 
 @dataclass(frozen=True)
+class ExampleEntry:
+    token: Token
+    parameter: Token | None
+    value: Node
+
+
+@dataclass(frozen=True)
+class Example:
+    token: Token
+    description: str | None
+    entries: tuple
+
+
+@dataclass(frozen=True)
 class Function:
     token: Token
     modifiers: frozenset
@@ -109,6 +128,7 @@ class Function:
     output: Type
     body: tuple = ()
     commutative: tuple = ()
+    examples: tuple = ()
 
     @property
     def name(self):
@@ -144,6 +164,7 @@ class Argument:
 
 TOKEN = re.compile(
     r'(?P<skip>\s+|//[^\n]*)|(?P<string>"(?:[^"\\\n]|\\[^\n])*")|'
+    r'(?P<decimal>[0-9]+(?:\.[0-9]+(?:[eE][+-]?[0-9]+)?|[eE][+-]?[0-9]+))|'
     r'(?P<integer>[0-9]+)|(?P<name>[A-Za-z_][A-Za-z_0-9]*)|'
     r'(?P<punct>!0|->|::|==|!=|<=|>=|[{}()\[\],.:;=<>+*/-])|(?P<invalid>.)'
 )
@@ -171,6 +192,15 @@ def tokenize(source):
         else:
             column += len(value)
     yield Token("<end of file>", line, column)
+
+
+def decode_string(token):
+    try:
+        value = json.loads(token.text)
+        value.encode("utf-8")
+    except (ValueError, UnicodeError) as error:
+        raise LanguageError(token, "invalid UTF-8 string literal or escape") from error
+    return value
 
 
 class Parser:
@@ -227,6 +257,9 @@ class Parser:
                 self.expect("{")
                 declarations.append(EnumDeclaration(name, self.separated("}", self.variant)))
                 continue
+            examples = []
+            while self.current.text == "example":
+                examples.append(self.example())
             modifiers = set()
             commutative = []
             while self.current.text in MODIFIERS:
@@ -244,8 +277,26 @@ class Parser:
             self.expect("->")
             output = self.type()
             declarations.append(Function(name, frozenset(modifiers), parameters, output,
-                                         self.block(), tuple(commutative)))
+                                         self.block(), tuple(commutative), tuple(examples)))
         return tuple(declarations)
+
+    def example(self):
+        token = self.expect("example")
+        description = decode_string(self.take()) if self.current.kind == "string" else None
+        self.expect("{")
+        entries = []
+        while not self.accept("}"):
+            entry = self.take()
+            if entry.text in {"input", "after"}:
+                parameter = self.name()
+                self.expect(":")
+            elif entry.text == "expect":
+                parameter = None
+            else:
+                raise LanguageError(entry, "expected 'input', 'expect', 'after', or '}' in example")
+            entries.append(ExampleEntry(entry, parameter, self.expression()))
+            self.expect(";")
+        return Example(token, description, tuple(entries))
 
     def separated(self, end, read):
         items = []
@@ -397,21 +448,22 @@ class Parser:
             return expression
         if token.text == "[":
             return Node(token, "list", self.separated("]", self.expression))
-        if token.text == "-" or token.kind == "integer":
-            digits = self.take() if token.text == "-" else token
+        if token.text == "-" or token.kind in {"integer", "decimal"}:
+            negative = token.text == "-"
+            digits = self.take() if negative else token
+            if digits.kind == "decimal":
+                value = float(digits.text)
+                if not math.isfinite(value):
+                    raise LanguageError(token, "decimal literal is outside the finite f64 range")
+                return Node(token, "decimal", (-value if negative else value,))
             if digits.kind != "integer":
-                raise LanguageError(digits, "expected an integer literal after '-'")
+                raise LanguageError(digits, "expected a numeric literal after '-'")
             value = digits.text.lstrip("0") or "0"
             if len(value) > 10:
                 raise LanguageError(token, "integer literal is outside the int32 range")
-            return Node(token, "integer", (-int(value) if token.text == "-" else int(value),))
+            return Node(token, "integer", (-int(value) if negative else int(value),))
         if token.kind == "string":
-            try:
-                value = json.loads(token.text)
-                value.encode("utf-8")
-            except (ValueError, UnicodeError) as error:
-                raise LanguageError(token, "invalid UTF-8 string literal or escape") from error
-            return Node(token, "value", (value, STRING))
+            return Node(token, "value", (decode_string(token), STRING))
         if token.text in {"true", "false"}:
             return Node(token, "value", (token.text == "true", BOOL))
         if token.text == "unit":

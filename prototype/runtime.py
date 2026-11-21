@@ -2,12 +2,15 @@
 
 import codecs
 from dataclasses import dataclass, field
+import json
 from operator import eq, ge, gt, le, lt, ne, truediv
 import os
 from pathlib import Path
 import secrets
 from select import select
 from time import monotonic
+
+from .syntax import EXAMPLE_ERROR_MESSAGES
 
 try:
     import termios
@@ -286,6 +289,26 @@ class Interpreter:
         _, value = self.block(function.body, environment)
         return value
 
+    def example_mismatches(self, function, example):
+        arguments = []
+        mutable = {}
+        for parameter, expression in zip(function.parameters, example.inputs, strict=True):
+            value = self.expression(expression, {})
+            if parameter.mutable:
+                value = Cell(value)
+                mutable[parameter.name] = value
+            arguments.append(value)
+
+        actual = self.call(function.name, arguments)
+        expected = self.expression(example.output, {})
+        if actual != expected:
+            yield "return value", expected, actual
+        for name, expression in example.after:
+            actual = mutable[name].value
+            expected = self.expression(expression, {})
+            if actual != expected:
+                yield f"mut parameter '{name}'", expected, actual
+
     def block(self, statements, environment):
         for node in statements:
             kind, fields = node.kind, node.fields
@@ -344,6 +367,9 @@ class Interpreter:
         if kind == "result":
             tag, value = fields
             return Result(tag, self.expression(value, environment))
+        if kind == "failure":
+            code, message = fields
+            return Failure(code, "" if message is None else self.expression(message, environment))
         if kind == "variant":
             name, tag, payload = fields
             value = None if payload is None else self.expression(payload, environment)
@@ -371,23 +397,28 @@ class Interpreter:
         return arguments
 
 
-def display(value):
+def display(value, *, literal=False):
     if value is None:
         return "unit"
     if isinstance(value, bool):
         return "true" if value else "false"
+    if literal and isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
     if isinstance(value, Result):
-        return f"{value.tag}({display(value.value)})"
+        return f"{value.tag}({display(value.value, literal=literal)})"
     if isinstance(value, Variant):
         tag = f"{value.name}::{value.tag}"
-        return tag if value.value is None else f"{tag}({display(value.value)})"
+        return tag if value.value is None else f"{tag}({display(value.value, literal=literal)})"
     if isinstance(value, Record):
-        fields = ", ".join(f"{name}: {display(field)}" for name, field in value.fields)
+        fields = ", ".join(f"{name}: {display(field, literal=literal)}" for name, field in value.fields)
         return f"{value.name}({fields})"
     if isinstance(value, Failure):
+        if literal and value.code in EXAMPLE_ERROR_MESSAGES:
+            message = display(value.message, literal=True) if EXAMPLE_ERROR_MESSAGES[value.code] else ""
+            return f"{value.code}({message})"
         return f"{value.code}: {value.message}" if value.message else value.code
     if isinstance(value, tuple):
-        return "[" + ", ".join(map(display, value)) + "]"
+        return "[" + ", ".join(display(item, literal=literal) for item in value) + "]"
     if isinstance(value, (Console, Filesystem)):
         return type(value).__name__.lower()
     if isinstance(value, RandomSource):

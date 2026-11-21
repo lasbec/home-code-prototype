@@ -1,11 +1,11 @@
 """Static checking and lowering to an interpreter-ready program."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from .syntax import (
-    BOOL, CONSOLE, FILESYSTEM, GUARANTEES, HOST_ERROR, HOST_ERROR_KIND, INDEX_ERROR,
-    INT, OVERFLOW, PARSE_INT_ERROR, RANDOM, RANDOM_DRAW, SIMPLE_TYPES, STRING, UNIT, ZERO, Argument,
-    EnumDeclaration, Function, LanguageError, Node, Parameter, RecordDeclaration,
+    BOOL, CONSOLE, EXAMPLE_ERROR_MESSAGES, FILESYSTEM, FLOAT, GUARANTEES, HOST_ERROR, HOST_ERROR_KIND,
+    INDEX_ERROR, INT, OVERFLOW, PARSE_INT_ERROR, RANDOM, RANDOM_DRAW, SIMPLE_TYPES, STRING, UNIT, ZERO,
+    Argument, EnumDeclaration, Function, LanguageError, Node, Parameter, RecordDeclaration,
     Token, Type, product_units, quotient_units, result_type,
 )
 
@@ -50,6 +50,7 @@ PURE_FUNCTIONS = {
 GENERIC_FUNCTIONS = {"add", "subtract", "min", "max", "nonzero", "at", "prepend", "dropLast"}
 CONSTRUCTORS = {"Ok", "Err"}
 BUILTIN_NAMES = HOST_FUNCTIONS.keys() | PURE_FUNCTIONS.keys() | GENERIC_FUNCTIONS | CONSTRUCTORS
+EXAMPLE_VALUE_KINDS = {"value", "integer", "decimal", "list", "variant", "call"}
 
 
 @dataclass(frozen=True)
@@ -64,9 +65,10 @@ class Flow:
     bindings: dict = field(default_factory=dict)
     nonzero: set = field(default_factory=set)
     protected: frozenset = frozenset()
+    literals_only: bool = False
 
     def copy(self):
-        return Flow(self.bindings.copy(), self.nonzero.copy(), self.protected)
+        return Flow(self.bindings.copy(), self.nonzero.copy(), self.protected, self.literals_only)
 
     def type_of(self, name):
         declared = self.bindings[name].type
@@ -103,6 +105,15 @@ class Flow:
 class Checked:
     type: Type
     node: Node
+
+
+@dataclass(frozen=True)
+class CheckedExample:
+    token: Token
+    description: str | None
+    inputs: tuple
+    output: Node
+    after: tuple
 
 
 def compatible(actual, expected):
@@ -165,6 +176,9 @@ class Checker:
                 self.check_signature(declaration)
 
     def check_signature(self, function):
+        if function.examples and not {"deterministic", "terminates"} <= function.modifiers:
+            raise LanguageError(function.examples[0].token,
+                                "examples require a deterministic terminates function")
         if "pure" in function.modifiers and any(p.mutable for p in function.parameters):
             raise LanguageError(function.token, "a pure function cannot accept a mut parameter")
         if "commutative" in function.modifiers:
@@ -196,10 +210,45 @@ class Checker:
             if not returns and function.output != UNIT:
                 raise LanguageError(function.token, f"some paths do not return {function.output}")
             self.check_commutativity(function, body)
-            checked[function.name] = Function(function.token, function.modifiers, function.parameters,
-                                              function.output, body, function.commutative)
+            examples = tuple(self.check_example(function, example) for example in function.examples)
+            checked[function.name] = replace(function, body=body, examples=examples)
         self.check_termination(checked)
         return checked
+
+    def check_example(self, function, example):
+        parameters = {parameter.name: parameter for parameter in function.parameters}
+        inputs = {}
+        after = {}
+        output = None
+        flow = Flow(literals_only=True)
+        for entry in example.entries:
+            kind = entry.token.text
+            if kind == "expect":
+                if output is not None:
+                    raise LanguageError(entry.token, "example has more than one 'expect' entry")
+                output = self.expression(entry.value, flow, function.output).node
+                continue
+            name = entry.parameter.text
+            parameter = parameters.get(name)
+            if parameter is None:
+                raise LanguageError(entry.parameter, f"'{function.name}' has no parameter named '{name}'")
+            if kind == "after" and not parameter.mutable:
+                raise LanguageError(entry.parameter, f"'after' requires a mut parameter, but '{name}' is read-only")
+            values = inputs if kind == "input" else after
+            if name in values:
+                raise LanguageError(entry.parameter, f"duplicate '{kind}' entry for '{name}'")
+            values[name] = self.expression(entry.value, flow, parameter.type).node
+
+        for parameter in function.parameters:
+            name = parameter.name
+            if name not in inputs:
+                raise LanguageError(example.token, f"example is missing an 'input' entry for '{name}'")
+            if parameter.mutable and name not in after:
+                raise LanguageError(example.token, f"example is missing an 'after' entry for '{name}'")
+        if output is None:
+            raise LanguageError(example.token, "example is missing an 'expect' entry")
+        return CheckedExample(example.token, example.description, tuple(inputs[name] for name in parameters),
+                              output, tuple((name, after[name]) for name in parameters if name in after))
 
     def check_commutativity(self, function, body):
         slots = function.commutative_slots
@@ -383,6 +432,8 @@ class Checker:
 
     def infer(self, node, flow, expected):
         kind, fields = node.kind, node.fields
+        if flow.literals_only and kind not in EXAMPLE_VALUE_KINDS:
+            raise LanguageError(node.token, "example values must be literals")
         if kind == "value":
             value, value_type = fields
             return Checked(value_type, Node(node.token, kind, (value,)))
@@ -392,6 +443,9 @@ class Checker:
                 raise LanguageError(node.token, "integer literal is outside the int32 range")
             base = expected.without_refinement() if expected and expected.name == "int32" else INT
             return Checked(base.refined() if value else base, Node(node.token, "value", (value,)))
+        if kind == "decimal":
+            value_type = expected if expected and expected.name == "f64" else FLOAT
+            return Checked(value_type, Node(node.token, "value", fields))
         if kind == "variable":
             name, = fields
             if name not in flow.bindings and (name in self.functions or name in BUILTIN_NAMES):
@@ -557,6 +611,10 @@ class Checker:
             return Checked(expected, Node(node.token, "result", (name, value.node)))
         if name in self.records:
             return self.construct_record(node, name, flow)
+        if flow.literals_only:
+            if name in EXAMPLE_ERROR_MESSAGES:
+                return self.example_error(node, flow)
+            raise LanguageError(node.token, "example values must be literals; ordinary calls are not allowed")
         if name == "prepend":
             return self.prepend(node, flow, expected)
         signature = self.functions.get(name) or HOST_FUNCTIONS.get(name) or PURE_FUNCTIONS.get(name)
@@ -569,6 +627,19 @@ class Checker:
             guarantees = ", ".join(sorted(missing))
             raise LanguageError(node.token, f"'{name}' lacks required guarantee(s): {guarantees}")
         return self.bind_arguments(node, name, signature, flow)
+
+    def example_error(self, node, flow):
+        name = node.token.text
+        arguments = node.fields
+        if not EXAMPLE_ERROR_MESSAGES[name]:
+            if arguments:
+                raise LanguageError(node.token, f"{name} takes no arguments in an example")
+            message = None
+        else:
+            if len(arguments) != 1 or arguments[0].mutable or arguments[0].label is not None:
+                raise LanguageError(node.token, f"{name} takes one unnamed string literal in an example")
+            message = self.expression(arguments[0].expression, flow, STRING).node
+        return Checked(Type(name), Node(node.token, "failure", (name, message)))
 
     def construct_record(self, node, name, flow):
         signature = self.records[name]
