@@ -49,6 +49,16 @@ The game saves completed rounds in `snake-scores.txt` in the current working dir
 
 Run the game and language checks with `python3 -B -m unittest discover -s tests`.
 
+## Nano syntax highlighting
+
+Add this line to your Nano configuration (`~/.nanorc` or `~/.config/nano/nanorc`), using the absolute path to your checkout.
+
+```nanorc
+include "/path/to/home-code-prototype/editors/nano/home-code.nanorc"
+```
+
+Nano automatically selects this syntax for `.proto` files under a directory named `home-code-prototype`. To select it for a file in a renamed checkout or elsewhere, run `nano -Y home-code path/to/file.proto`.
+
 ## Function examples
 
 Place any number of `example` blocks directly above a user-defined function declared both `deterministic` and `terminates`. Each block can have a quoted description.
