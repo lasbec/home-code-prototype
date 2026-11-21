@@ -97,7 +97,7 @@ class CommutativeGroups(unittest.TestCase):
 class RandomFunctions(unittest.TestCase):
     def test_pseudo_random_replays_and_steps_for_every_valid_range(self):
         interpreter = compile_program("""
-            pure deterministic terminates
+            pure ending
             commutative a b fn draw(a: int32, b: int32, seed: int32) -> RandomDraw {
                 return pseudoRandom(state: seed, a, b);
             }

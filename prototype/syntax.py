@@ -65,7 +65,7 @@ PARSE_INT_ERROR = Type("ParseIntError")
 EXAMPLE_ERROR_MESSAGES = {
     OVERFLOW.name: False, ZERO.name: False, INDEX_ERROR.name: True, PARSE_INT_ERROR.name: True,
 }
-GUARANTEES = frozenset({"terminates", "deterministic", "pure"})
+GUARANTEES = frozenset({"ending", "deterministic", "pure"})
 MODIFIERS = GUARANTEES | {"commutative"}
 SIMPLE_TYPES = {
     item.name for item in (BOOL, STRING, UNIT, CONSOLE, FILESYSTEM, RANDOM, RANDOM_DRAW,

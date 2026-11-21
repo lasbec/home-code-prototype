@@ -4,7 +4,7 @@ example "distance per second" {
     input distance: -7;
     expect -3.5;
 }
-pure deterministic terminates fn speed(elapsed: int32!0<seconds>, distance: int32<meter>) -> f64<meter/seconds> {
+pure deterministic ending fn speed(elapsed: int32!0<seconds>, distance: int32<meter>) -> f64<meter/seconds> {
     return distance / elapsed as f64<meter/seconds>;
 }
 
@@ -13,7 +13,7 @@ example "sets the duration to three seconds" {
     expect unit;
     after elapsed: 3;
 }
-deterministic terminates fn setDuration(elapsed: mut int32!0<seconds>) -> unit {
+deterministic ending fn setDuration(elapsed: mut int32!0<seconds>) -> unit {
     elapsed = 3;
 }
 
@@ -27,11 +27,11 @@ example "reports overflow" {
     input b: 1;
     expect Err(Overflow());
 }
-pure deterministic terminates commutative fn total(a: int32<seconds>, b: int32<seconds>) -> result<int32<seconds>, Overflow> {
+pure deterministic ending commutative fn total(a: int32<seconds>, b: int32<seconds>) -> result<int32<seconds>, Overflow> {
     return a + b;
 }
 
-pure deterministic terminates fn sum(items: list<int32<seconds>>) -> result<int32<seconds>, Overflow> {
+pure ending fn sum(items: list<int32<seconds>>) -> result<int32<seconds>, Overflow> {
     let mut accumulator: int32<seconds> = 0;
     for item in items {
         match total(accumulator, item) {
@@ -42,7 +42,7 @@ pure deterministic terminates fn sum(items: list<int32<seconds>>) -> result<int3
     return Ok(accumulator);
 }
 
-deterministic terminates fn main() -> list<f64<meter/seconds>> {
+deterministic ending fn main() -> list<f64<meter/seconds>> {
     let mut elapsed: int32<seconds> = 0;
     match sum([1, 2, 3]) {
         Ok(value) { elapsed = value; }

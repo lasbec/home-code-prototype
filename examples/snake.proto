@@ -19,7 +19,7 @@ enum Command { Move(Direction), Quit, Invalid }
 record ScoreHistory { text: string, best: int32 }
 enum Scores { Ready(ScoreHistory), Unavailable(string) }
 
-pure deterministic terminates fn columns() -> list<int32> {
+pure ending fn columns() -> list<int32> {
     return [
         0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
         12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
@@ -28,7 +28,7 @@ pure deterministic terminates fn columns() -> list<int32> {
     ];
 }
 
-pure deterministic terminates fn rows() -> list<int32> {
+pure ending fn rows() -> list<int32> {
     return [
         0, 1, 2, 3, 4, 5, 6, 7,
         8, 9, 10, 11, 12, 13, 14, 15,
@@ -37,7 +37,7 @@ pure deterministic terminates fn rows() -> list<int32> {
     ];
 }
 
-pure deterministic terminates fn initialGame(seed: int32) -> Game {
+pure ending fn initialGame(seed: int32) -> Game {
     let head = Position(x: 3, y: 3);
     let body = [Position(x: 2, y: 3), Position(x: 1, y: 3)];
     let spawn = nextFood(prepend(head, body), seed);
@@ -51,19 +51,19 @@ pure deterministic terminates fn initialGame(seed: int32) -> Game {
     );
 }
 
-pure deterministic terminates fn samePosition(first: Position, second: Position) -> bool {
+pure ending fn samePosition(first: Position, second: Position) -> bool {
     if first.x != second.x { return false; }
     return first.y == second.y;
 }
 
-pure deterministic terminates fn contains(positions: list<Position>, target: Position) -> bool {
+pure ending fn contains(positions: list<Position>, target: Position) -> bool {
     for position in positions {
         if samePosition(first: position, second: target) { return true; }
     }
     return false;
 }
 
-pure deterministic terminates fn isReverse(current: Direction, requested: Direction) -> bool {
+pure ending fn isReverse(current: Direction, requested: Direction) -> bool {
     match current {
         Up { return requested == Direction::Down; }
         Down { return requested == Direction::Up; }
@@ -72,7 +72,7 @@ pure deterministic terminates fn isReverse(current: Direction, requested: Direct
     }
 }
 
-pure deterministic terminates fn offset(direction: Direction) -> Position {
+pure ending fn offset(direction: Direction) -> Position {
     match direction {
         Up { return Position(x: 0, y: -1); }
         Down { return Position(x: 0, y: 1); }
@@ -81,7 +81,7 @@ pure deterministic terminates fn offset(direction: Direction) -> Position {
     }
 }
 
-pure deterministic terminates fn moveHead(head: Position, direction: Direction) -> result<Position, Overflow> {
+pure ending fn moveHead(head: Position, direction: Direction) -> result<Position, Overflow> {
     let delta = offset(direction);
     match head.x + delta.x {
         Ok(x) {
@@ -94,7 +94,7 @@ pure deterministic terminates fn moveHead(head: Position, direction: Direction) 
     }
 }
 
-pure deterministic terminates fn insideBoard(position: Position) -> bool {
+pure ending fn insideBoard(position: Position) -> bool {
     match at(columns(), position.x) {
         Ok(column) {
             match at(rows(), position.y) {
@@ -106,14 +106,14 @@ pure deterministic terminates fn insideBoard(position: Position) -> bool {
     }
 }
 
-pure deterministic terminates fn foodAt(food: Food, position: Position) -> bool {
+pure ending fn foodAt(food: Food, position: Position) -> bool {
     match food {
         Available(target) { return samePosition(first: target, second: position); }
         Full { return false; }
     }
 }
 
-pure deterministic terminates fn nextFood(occupied: list<Position>, state: int32) -> FoodSpawn {
+pure ending fn nextFood(occupied: list<Position>, state: int32) -> FoodSpawn {
     let xs = columns();
     let ys = rows();
     let mut free: list<Position> = [];
@@ -140,7 +140,7 @@ pure deterministic terminates fn nextFood(occupied: list<Position>, state: int32
     return FoodSpawn(food: Food::Full, randomState: state);
 }
 
-pure deterministic terminates fn grow(game: Game, head: Position, body: list<Position>, direction: Direction) -> result<Turn, Overflow> {
+pure ending fn grow(game: Game, head: Position, body: list<Position>, direction: Direction) -> result<Turn, Overflow> {
     match game.score + 1 {
         Ok(score) {
             let spawn = nextFood(prepend(head, body), game.randomState);
@@ -155,7 +155,7 @@ pure deterministic terminates fn grow(game: Game, head: Position, body: list<Pos
     }
 }
 
-pure deterministic terminates fn advance(game: Game, direction: Direction) -> result<Turn, Overflow> {
+pure ending fn advance(game: Game, direction: Direction) -> result<Turn, Overflow> {
     if isReverse(current: game.direction, requested: direction) {
         return Ok(Turn::Reversed);
     }
@@ -180,14 +180,14 @@ pure deterministic terminates fn advance(game: Game, direction: Direction) -> re
     }
 }
 
-pure deterministic terminates fn tile(game: Game, cell: Position) -> string {
+pure ending fn tile(game: Game, cell: Position) -> string {
     if samePosition(first: game.head, second: cell) { return "@"; }
     if contains(game.body, cell) { return "o"; }
     if foodAt(game.food, cell) { return "*"; }
     return ".";
 }
 
-pure deterministic terminates fn render(game: Game) -> string {
+pure ending fn render(game: Game) -> string {
     let xs = columns();
     let ys = rows();
     let mut board = "";
@@ -200,7 +200,7 @@ pure deterministic terminates fn render(game: Game) -> string {
     return concat(left: board, right: concat(left: "Score: ", right: formatInt32(game.score)));
 }
 
-pure deterministic terminates fn command(text: string) -> Command {
+pure ending fn command(text: string) -> Command {
     if text == "w" { return Command::Move(Direction::Up); }
     if text == "a" { return Command::Move(Direction::Left); }
     if text == "s" { return Command::Move(Direction::Down); }
@@ -210,12 +210,12 @@ pure deterministic terminates fn command(text: string) -> Command {
 }
 
 // Scores are stored as one nonnegative decimal integer per line.
-pure deterministic terminates fn appendScore(text: string, score: int32) -> string {
+pure ending fn appendScore(text: string, score: int32) -> string {
     let line = concat(left: formatInt32(score), right: "\n");
     return concat(left: text, right: line);
 }
 
-pure deterministic terminates fn parseScores(text: string) -> Scores {
+pure ending fn parseScores(text: string) -> Scores {
     let lines = splitLines(text);
     let mut best = 0;
     let mut history = "";
@@ -244,7 +244,7 @@ fn loadScores(files: filesystem, path: string) -> Scores {
     }
 }
 
-pure deterministic terminates fn scoreHeader(scores: Scores) -> string {
+pure ending fn scoreHeader(scores: Scores) -> string {
     match scores {
         Ready(history) {
             return concat(left: "Best score: ", right: formatInt32(history.best));
@@ -276,7 +276,7 @@ fn finishRound(terminal: console, files: filesystem, path: string, scores: Score
     return print(terminal, concat(left: summary, right: concat(left: "\n", right: status)));
 }
 
-pure deterministic terminates fn commandForTick(keys: list<string>, direction: Direction) -> Command {
+pure ending fn commandForTick(keys: list<string>, direction: Direction) -> Command {
     let mut selected = direction;
     for key in keys {
         match command(key) {
@@ -293,7 +293,7 @@ pure deterministic terminates fn commandForTick(keys: list<string>, direction: D
     return Command::Move(selected);
 }
 
-pure deterministic terminates fn commandInputError(error: HostError) -> result<Command, HostError> {
+pure ending fn commandInputError(error: HostError) -> result<Command, HostError> {
     if hostErrorKind(error) == HostErrorKind::EndOfInput { return Ok(Command::Quit); }
     return Err(error);
 }
@@ -311,7 +311,7 @@ fn readCommand(terminal: console, direction: Direction, interactive: bool) -> re
     }
 }
 
-pure deterministic terminates fn screenText(game: Game, heading: string) -> string {
+pure ending fn screenText(game: Game, heading: string) -> string {
     let header = concat(left: "\u001b[H", right: concat(left: heading, right: "\n"));
     let board = concat(left: render(game), right: "\n\u001b[J");
     return concat(left: header, right: board);
@@ -322,7 +322,7 @@ fn showBoard(terminal: console, game: Game, heading: string, interactive: bool) 
     return print(terminal, render(game));
 }
 
-pure deterministic terminates fn victoryText(game: Game, heading: string, interactive: bool) -> string {
+pure ending fn victoryText(game: Game, heading: string, interactive: bool) -> string {
     if interactive {
         return concat(left: screenText(game, heading), right: "You filled the board!");
     }

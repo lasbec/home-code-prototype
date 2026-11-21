@@ -1,4 +1,4 @@
-terminates fn extend(items: mut list<int32>) -> unit {
+ending fn extend(items: mut list<int32>) -> unit {
     for item in items {
         items = [item, item];
     }

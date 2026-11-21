@@ -4,7 +4,7 @@ example "reports both mismatches" {
     expect 5;
     after elapsed: 5;
 }
-deterministic terminates fn setDuration(elapsed: mut int32<seconds>) -> int32<seconds> {
+deterministic ending fn setDuration(elapsed: mut int32<seconds>) -> int32<seconds> {
     elapsed = 3;
     return elapsed;
 }

@@ -41,7 +41,7 @@ class FunctionExamples(unittest.TestCase):
                 after state: ReadingState::Ready(Reading(distance: -0.5, labels: []));
                 after backup: ReadingState::Ready(Reading(distance: 1.0, labels: ["saved"]));
             }
-            deterministic terminates fn configure(state: mut ReadingState, backup: mut ReadingState)
+            deterministic ending fn configure(state: mut ReadingState, backup: mut ReadingState)
                     -> result<ReadingState, Zero> {
                 state = ReadingState::Ready(Reading(distance: -0.5, labels: []));
                 return Ok(backup);
@@ -51,7 +51,7 @@ class FunctionExamples(unittest.TestCase):
                 input index: 3;
                 expect Err(IndexError("index 3 is outside the list"));
             }
-            deterministic terminates fn find(index: int32) -> result<int32, IndexError> {
+            deterministic ending fn find(index: int32) -> result<int32, IndexError> {
                 return at([10], index);
             }
         """)
@@ -63,12 +63,12 @@ class FunctionExamples(unittest.TestCase):
             example "first" { input n: 2; expect 0.5000000000000001; after n: 3; }
             example { input n: 8; expect 0.5; after n: 4; }
             example "third" { input n: 1; expect 0.0; after n: 4; }
-            deterministic terminates fn reset(n: mut int32) -> f64 {
+            deterministic ending fn reset(n: mut int32) -> f64 {
                 n = 4;
                 return 0.5;
             }
             example { expect Err(ParseIntError("wrong message")); }
-            deterministic terminates fn parse() -> result<int32, ParseIntError> {
+            deterministic ending fn parse() -> result<int32, ParseIntError> {
                 return parseInt32("abc");
             }
             fn main(terminal: console) -> unit {}
@@ -85,7 +85,7 @@ class FunctionExamples(unittest.TestCase):
                       'got Err(ParseIntError("expected a decimal integer"))', lines[3])
 
     def test_cases_are_checked_in_every_command_and_executed_only_by_test(self):
-        source = "example { expect 1; } deterministic terminates fn main() -> int32 { return 2; }"
+        source = "example { expect 1; } deterministic ending fn main() -> int32 { return 2; }"
         for command, expected in (("check", "OK"), ("run", "2")):
             with self.subTest(command=command):
                 result = self.cli(command, source)
@@ -102,7 +102,7 @@ class FunctionExamples(unittest.TestCase):
         self.assertEqual(empty.stdout.strip(), "0 passed, 0 failed (0 total)")
 
     def test_rejects_invalid_example_entries(self):
-        signature = "deterministic terminates fn f(n: mut int32!0, read: int32) -> unit {}"
+        signature = "deterministic ending fn f(n: mut int32!0, read: int32) -> unit {}"
         for entries, error in (
             ("input read: 1; expect unit;", "missing an 'input' entry for 'n'"),
             ("input n: 1; input read: 1; expect unit;", "missing an 'after' entry for 'n'"),
@@ -128,16 +128,22 @@ class FunctionExamples(unittest.TestCase):
                 source = f"""
                     record Pair {{ items: list<int32> }}
                     example {{ expect Ok(Pair(items: [{expression}])); }}
-                    deterministic terminates fn f() -> result<Pair, Overflow> {{ return Ok(Pair(items: [])); }}
+                    deterministic ending fn f() -> result<Pair, Overflow> {{ return Ok(Pair(items: [])); }}
                 """
                 with self.assertRaisesRegex(LanguageError, "values must be literals"):
                     Checker(Parser(source).program()).program()
 
-        for modifiers in ("", "deterministic", "terminates"):
+        for modifiers in ("", "deterministic", "ending", "pure ending", "pure deterministic"):
             with self.subTest(modifiers=modifiers):
                 source = f"example {{ expect unit; }} {modifiers} fn f() -> unit {{}}"
-                with self.assertRaisesRegex(LanguageError, "require a deterministic terminates function"):
+                with self.assertRaisesRegex(LanguageError, "require explicit 'deterministic' and 'ending'"):
                     Checker(Parser(source).program()).program()
+
+    def test_accepts_explicit_deterministic_on_pure_function_with_examples(self):
+        source = "example { expect unit; } pure deterministic ending fn f() -> unit {}"
+        result = self.cli("test", source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "1 passed, 0 failed (1 total)")
 
     def test_rejects_nonfinite_decimal_literals(self):
         source = "fn main() -> f64 { return -1e999; }"

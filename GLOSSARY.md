@@ -4,7 +4,7 @@
 
 **Function guarantee**
 
-A property declared on a function and checked by the compiler. `terminates` guarantees completion, `deterministic` guarantees repeatable results and observable effects for the same inputs and input state, and `pure` rules out host effects and caller-visible mutation.
+A property declared on a function and checked by the compiler. `ending` guarantees completion, `deterministic` guarantees repeatable results and observable effects for the same inputs and input state, and `pure` implies determinism and rules out host effects and caller-visible mutation.
 
 **Commutative function**
 

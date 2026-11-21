@@ -209,9 +209,24 @@ class SnakePersistence(unittest.TestCase):
 
 
 class LanguageRules(unittest.TestCase):
+    def test_deterministic_caller_accepts_pure_callee(self):
+        interpreter = compile_program("""
+            pure fn value() -> int32 { return 7; }
+            deterministic fn main() -> int32 { return value(); }
+        """)
+        self.assertEqual(interpreter.call("main", ()), 7)
+
     def test_guarantees_and_exhaustiveness(self):
         cases = (
-            ("terminates fn main() -> unit { loop {} }", "cannot guarantee termination"),
+            ("terminates fn main() -> unit {}", "expected 'fn', found 'terminates'"),
+            ("ending fn main() -> unit { loop {} }", "cannot guarantee termination"),
+            ("ending fn main() -> unit { main(); }", "cannot guarantee termination"),
+            ("""pure fn helper() -> unit {}
+               ending fn main() -> unit { helper(); }
+               """, "lacks required guarantee(s): ending"),
+            ("""deterministic fn helper() -> unit {}
+               pure fn main() -> unit { helper(); }
+               """, "lacks required guarantee(s): pure"),
             ("""pure fn advance(terminal: console) -> result<string, HostError> {
                    return input(terminal);
                }""", "lacks required guarantee(s): pure"),
@@ -231,7 +246,7 @@ class LanguageRules(unittest.TestCase):
 
     def test_nested_and_empty_lists(self):
         interpreter = compile_program("""
-            pure deterministic terminates fn main() -> list<list<int32>> {
+            pure ending fn main() -> list<list<int32>> {
                 let rows = prepend([1], [[2]]);
                 let single = dropLast(rows);
                 return prepend(item: [3], items: single);

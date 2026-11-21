@@ -176,9 +176,9 @@ class Checker:
                 self.check_signature(declaration)
 
     def check_signature(self, function):
-        if function.examples and not {"deterministic", "terminates"} <= function.modifiers:
+        if function.examples and not {"deterministic", "ending"} <= function.modifiers:
             raise LanguageError(function.examples[0].token,
-                                "examples require a deterministic terminates function")
+                                "examples require explicit 'deterministic' and 'ending' modifiers")
         if "pure" in function.modifiers and any(p.mutable for p in function.parameters):
             raise LanguageError(function.token, "a pure function cannot accept a mut parameter")
         if "commutative" in function.modifiers:
@@ -300,7 +300,7 @@ class Checker:
             proved.add(function.name)
 
         for function in checked.values():
-            if "terminates" in function.modifiers:
+            if "ending" in function.modifiers:
                 visit(function)
 
     def block(self, statements, flow):
@@ -357,7 +357,7 @@ class Checker:
             flow.nonzero = loop.nonzero
             lowered = (item.text, Node(source, "variable", (source.text,)), lowered_body)
         elif kind == "loop":
-            if "terminates" in self.current_function.modifiers:
+            if "ending" in self.current_function.modifiers:
                 raise LanguageError(node.token, "an unbounded loop cannot guarantee termination")
             lowered_body = self.loop_body(fields[0], flow)
             return Node(node.token, kind, (lowered_body,)), True
@@ -623,6 +623,9 @@ class Checker:
         if signature is None:
             raise LanguageError(node.token, f"unknown function '{name}'")
         missing = (self.current_function.modifiers & GUARANTEES) - signature.modifiers
+        # A pure callee provides determinism, and a pure caller already requires purity.
+        if "pure" in self.current_function.modifiers or "pure" in signature.modifiers:
+            missing -= {"deterministic"}
         if missing:
             guarantees = ", ".join(sorted(missing))
             raise LanguageError(node.token, f"'{name}' lacks required guarantee(s): {guarantees}")
