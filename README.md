@@ -28,12 +28,14 @@ python3 -B -m prototype run examples/live-io.proto --console --filesystem
 | `write(console, text)` | `result<unit, HostError>` |
 | `input(console)` | `result<string, HostError>` |
 | `enableKeyInput(console)` | `result<bool, HostError>` |
+| `disableKeyInput(console)` | `result<unit, HostError>` |
 | `readKeysFor(console, timeout: int32<ms>)` | `result<list<string>, HostError>` |
 | `readFileUTF8(filesystem, path)` | `result<string, HostError>` |
 | `writeFileUTF8(filesystem, path: path, text: text)` | `result<unit, HostError>` |
+| `replaceFileUTF8(filesystem, path: path, text: text)` | `result<unit, HostError>` |
 | `random(source: random, bound0: int32, bound1: int32)` | `result<int32, HostError>` |
 
-The host functions run immediately when called. `write` flushes text as supplied, and `print` also appends a newline. `input` reads one line and returns `Err(EndOfInput)` at end of input. `enableKeyInput` switches a supported Unix terminal to character input with echo disabled and returns `false` when that mode is unavailable. Once enabled, `readKeysFor` collects the decoded input characters in order for the given duration. A zero timeout polls immediately. The runner restores the terminal when the program exits. Host functions carry no function guarantees.
+The host functions run immediately when called. `write` flushes text as supplied, and `print` also appends a newline. `input` reads one line and returns `Err(EndOfInput)` at end of input. `enableKeyInput` switches a supported Unix terminal to character input with echo disabled and returns `false` when that mode is unavailable. Once enabled, `readKeysFor` collects the decoded input characters in order for the given duration. A zero timeout polls immediately. `disableKeyInput` restores line input, and the CLI restores terminal settings on exit. `replaceFileUTF8` writes a temporary file beside the destination and atomically replaces the destination after the write succeeds. Host functions carry no function guarantees.
 
 `random(source, bound0, bound1)` draws a uniform integer from the inclusive range. `pseudoRandom(state: seed, bound0, bound1)` is a pure, deterministic, terminating built-in for repeatable sequences. It returns a `RandomDraw` record with `value` and the next `state`, both `int32`. Pass the returned state into the next call. Each call takes one generator step, even when the bounds are equal. Both functions accept the bounds in either order. `pseudoRandom` maps its 32-bit outputs as evenly as possible across the range and is intended for simulations and games.
 
@@ -48,6 +50,25 @@ The board is 48 columns wide and 32 rows high. On a supported Unix terminal, Sna
 The game saves completed rounds in `snake-scores.txt` in the current working directory and reads the best score on startup. The score file assumes one running game writes it at a time. A malformed or unreadable history disables saving for that run.
 
 Run the game and language checks with `python3 -B -m unittest discover -s tests`.
+
+## Play Runner
+
+```sh
+python3 -B -m prototype run examples/runner/main.proto --console --filesystem --random
+python3 -B -m prototype test -r examples/runner/main.proto
+```
+
+Choose **Play**, enter a name, and press Space to jump over barriers (`#`) and gaps while collecting coins (`o`). The course advances automatically and speeds up as the distance milestones double, up to six tiles per second. Press `q` to return to the menu early. With redirected input or an unsupported terminal, Enter advances one tile and Space followed by Enter jumps.
+
+Completed runs are saved in `runner-scores.txt` in the working directory. The leaderboard keeps each player's best run, ranked by coins and then by distance. Names are case-sensitive. Use one running game per score file.
+
+## Modules
+
+Put imports before declarations. An import resolves a relative `.proto` path from the importing file and uses the filename stem as its namespace. For example, `import "./scores.proto"` makes exports available as `scores.loadScores(...)` or `scores.Score`. Stems must be valid identifiers. Circular imports and duplicate namespaces are errors.
+
+Mark public functions, records, and enums with `export`. Place function examples above the `export` line. Exported declarations can use public types in their signatures and fields. Each file imports the namespaces it uses directly. Variables are local to function bodies.
+
+`check`, `run`, and `test` check all reachable files. `run` invokes `main` from the selected file. `test` executes examples attached to functions in that file, and `test -r` includes examples from every reachable file once.
 
 ## Nano syntax highlighting
 

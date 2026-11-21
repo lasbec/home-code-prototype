@@ -1,0 +1,108 @@
+import "./game.proto"
+import "./scores.proto"
+
+pure ending fn describe(coins: int32, distance: int32) -> string {
+    let collected = concat(left: formatInt32(coins), right: " coins, ");
+    let traveled = concat(left: formatInt32(distance), right: " tiles");
+    return concat(left: collected, right: traveled);
+}
+
+fn leaderboard(terminal: console, files: filesystem, path: string) -> result<unit, HostError> {
+    match scores.loadScores(files, path) {
+        Ok(history) {
+            let mut board = "Leaderboard\n";
+            let mut empty = true;
+            for score in history {
+                empty = false;
+                let name = concat(left: score.player, right: ": ");
+                let summary = describe(coins: score.coins, distance: score.distance);
+                let row = concat(left: name, right: concat(left: summary, right: "\n"));
+                board = concat(left: board, right: row);
+            }
+            if empty { return print(terminal, "Leaderboard\nNo scores yet."); }
+            return write(terminal, board);
+        }
+        Err(error) { return print(terminal, concat(left: "Could not load leaderboard: ", right: error)); }
+    }
+}
+
+fn runGame(terminal: console, files: filesystem, source: random, path: string, player: string)
+    -> result<unit, HostError> {
+    match random(source, -2147483648, 2147483647) {
+        Ok(seed) {
+            match game.play(terminal, player: player, seed) {
+                Ok(outcome) {
+                    match outcome {
+                        Crash(run) {
+                            let score = scores.Score(player: player, coins: run.coins, distance: run.distance);
+                            let saved = scores.saveScore(files, path: path, score);
+                            let summary = describe(coins: run.coins, distance: run.distance);
+                            let crash = concat(left: "You crashed. ", right: summary);
+                            return print(terminal, concat(left: crash, right: concat(left: "\n", right: saved)));
+                        }
+                        Abandoned { return print(terminal, "Run abandoned."); }
+                    }
+                }
+                Err(error) { return Err(error); }
+            }
+        }
+        Err(error) { return Err(error); }
+    }
+}
+
+fn play(terminal: console, files: filesystem, source: random, path: string) -> result<unit, HostError> {
+    match print(terminal, "Player name:") {
+        Ok(written) {}
+        Err(error) { return Err(error); }
+    }
+    match input(terminal) {
+        Ok(player) {
+            if player == "" { return print(terminal, "Enter a nonempty player name."); }
+            return runGame(terminal, files, source, path: path, player: player);
+        }
+        Err(error) {
+            if hostErrorKind(error) == HostErrorKind::EndOfInput { return Ok(unit); }
+            return Err(error);
+        }
+    }
+}
+
+fn menu(terminal: console, files: filesystem, source: random) -> result<unit, HostError> {
+    let path = "runner-scores.txt";
+    loop {
+        match print(terminal, "\nRunner\n1. Play\n2. Leaderboard\n3. Quit") {
+            Ok(written) {}
+            Err(error) { return Err(error); }
+        }
+        match input(terminal) {
+            Ok(choice) {
+                if choice == "3" { return Ok(unit); }
+                let mut outcome: result<unit, HostError> = Ok(unit);
+                if choice == "1" {
+                    outcome = play(terminal, files, source, path);
+                } else {
+                    if choice == "2" {
+                        outcome = leaderboard(terminal, files, path);
+                    } else {
+                        outcome = print(terminal, "Choose 1, 2, or 3.");
+                    }
+                }
+                match outcome {
+                    Ok(written) {}
+                    Err(error) { return Err(error); }
+                }
+            }
+            Err(error) {
+                if hostErrorKind(error) == HostErrorKind::EndOfInput { return Ok(unit); }
+                return Err(error);
+            }
+        }
+    }
+}
+
+fn main(terminal: console, files: filesystem, source: random) -> unit {
+    match menu(terminal, files, source) {
+        Ok(done) {}
+        Err(error) { print(terminal, describeHostError(error)); }
+    }
+}

@@ -25,11 +25,14 @@ HOST_FUNCTIONS = {
         builtin("write", (("console", CONSOLE), ("text", STRING)), result_type(UNIT, HOST_ERROR)),
         builtin("input", (("console", CONSOLE),), result_type(STRING, HOST_ERROR)),
         builtin("enableKeyInput", (("console", CONSOLE),), result_type(BOOL, HOST_ERROR)),
+        builtin("disableKeyInput", (("console", CONSOLE),), result_type(UNIT, HOST_ERROR)),
         builtin("readKeysFor", (("console", CONSOLE), ("timeout", Type("int32", units=(("ms", 1),)))),
                 result_type(Type("list", (STRING,)), HOST_ERROR)),
         builtin("readFileUTF8", (("filesystem", FILESYSTEM), ("path", STRING)),
                 result_type(STRING, HOST_ERROR)),
         builtin("writeFileUTF8", (("filesystem", FILESYSTEM), ("path", STRING), ("text", STRING)),
+                result_type(UNIT, HOST_ERROR)),
+        builtin("replaceFileUTF8", (("filesystem", FILESYSTEM), ("path", STRING), ("text", STRING)),
                 result_type(UNIT, HOST_ERROR)),
         builtin("random", (("source", RANDOM), ("bound0", INT), ("bound1", INT)),
                 result_type(INT, HOST_ERROR), commutative=("bound0", "bound1")),
@@ -144,13 +147,35 @@ def merge_proofs(flow, branches):
 
 
 class Checker:
-    def __init__(self, declarations):
+    def __init__(self, declarations, *, module=None, imports=None, entry=True):
         self.functions = {}
-        self.records = {RANDOM_DRAW.name: builtin(RANDOM_DRAW.name, (("value", INT), ("state", INT)),
-                                                  RANDOM_DRAW, GUARANTEES)}
-        self.enums = {HOST_ERROR_KIND.name: {"EndOfInput": None, "FileNotFound": None, "Other": None}}
+        self.imported_functions = {}
+        self.record_names = {RANDOM_DRAW.name: RANDOM_DRAW}
+        self.enum_names = {HOST_ERROR_KIND.name: HOST_ERROR_KIND}
+        self.records = {RANDOM_DRAW: builtin(RANDOM_DRAW.name, (("value", INT), ("state", INT)),
+                                             RANDOM_DRAW, GUARANTEES)}
+        self.enums = {HOST_ERROR_KIND: {"EndOfInput": None, "FileNotFound": None, "Other": None}}
+        self.public_types = {
+            declaration.token.text: Type(declaration.token.text, module=module)
+            for declaration in declarations
+            if not isinstance(declaration, Function) and declaration.exported
+        }
+        self.private_types = {
+            Type(declaration.token.text, module=module) for declaration in declarations
+            if not isinstance(declaration, Function) and not declaration.exported
+        }
+        for namespace, dependency in (imports or {}).items():
+            self.records.update(dependency.records)
+            self.enums.update(dependency.enums)
+            for name, value_type in dependency.public_types.items():
+                names = self.record_names if value_type in self.records else self.enum_names
+                names[f"{namespace}.{name}"] = value_type
+            self.imported_functions.update({
+                f"{namespace}.{name}": function for name, function in dependency.functions.items()
+                if function.exported
+            })
         self.current_function = None
-        used_names = set(BUILTIN_NAMES) | self.records.keys()
+        used_names = set(BUILTIN_NAMES) | {RANDOM_DRAW.name}
         builtin_types = SIMPLE_TYPES | {"int32", "f64", "result", "list"}
         for declaration in declarations:
             token = declaration.token
@@ -158,24 +183,45 @@ class Checker:
             if name in used_names or (not isinstance(declaration, Function) and name in builtin_types):
                 raise LanguageError(token, f"name '{name}' is already in use")
             used_names.add(name)
+            value_type = Type(name, module=module)
             if isinstance(declaration, RecordDeclaration):
                 fields = [field.name for field in declaration.fields]
                 if len(fields) != len(set(fields)):
                     raise LanguageError(token, f"record '{name}' has duplicate fields")
-                self.records[name] = builtin(name, ((f.name, f.type) for f in declaration.fields),
-                                             Type(name), GUARANTEES)
+                if declaration.exported:
+                    for parameter in declaration.fields:
+                        self.check_public_type(parameter.type, parameter.token)
+                self.record_names[name] = value_type
+                self.records[value_type] = builtin(name, ((f.name, f.type) for f in declaration.fields),
+                                                   value_type, GUARANTEES)
             elif isinstance(declaration, EnumDeclaration):
                 variants = {tag.text: payload for tag, payload in declaration.variants}
                 if len(variants) != len(declaration.variants):
                     raise LanguageError(token, f"enum '{name}' has duplicate variants")
                 if not variants:
                     raise LanguageError(token, f"enum '{name}' needs at least one variant")
-                self.enums[name] = variants
+                if declaration.exported:
+                    for tag, payload in declaration.variants:
+                        if payload is not None:
+                            self.check_public_type(payload, tag)
+                self.enum_names[name] = value_type
+                self.enums[value_type] = variants
             else:
-                self.functions[name] = declaration
-                self.check_signature(declaration)
+                function = replace(declaration, module=module)
+                self.functions[name] = function
+                self.check_signature(function, entry)
+                if function.exported:
+                    self.check_public_type(function.output, token)
+                    for parameter in function.parameters:
+                        self.check_public_type(parameter.type, parameter.token)
 
-    def check_signature(self, function):
+    def check_public_type(self, value_type, token):
+        if value_type in self.private_types:
+            raise LanguageError(token, f"exported declaration uses private type '{value_type}'")
+        for argument in value_type.arguments:
+            self.check_public_type(argument, token)
+
+    def check_signature(self, function, entry):
         if function.examples and not {"deterministic", "ending"} <= function.modifiers:
             raise LanguageError(function.examples[0].token,
                                 "examples require explicit 'deterministic' and 'ending' modifiers")
@@ -191,7 +237,7 @@ class Checker:
                 raise LanguageError(function.token, "commutative must name its parameters on functions with arity other than two")
             if any(parameter.mutable for parameter in group) or len({parameter.type for parameter in group}) != 1:
                 raise LanguageError(function.token, "commutative parameters must be read-only and have the same type")
-        if function.name == "main":
+        if entry and function.name == "main":
             capabilities = [parameter.type for parameter in function.parameters]
             if (any(parameter.mutable for parameter in function.parameters)
                     or not set(capabilities) <= {CONSOLE, FILESYSTEM, RANDOM}
@@ -211,7 +257,7 @@ class Checker:
                 raise LanguageError(function.token, f"some paths do not return {function.output}")
             self.check_commutativity(function, body)
             examples = tuple(self.check_example(function, example) for example in function.examples)
-            checked[function.name] = replace(function, body=body, examples=examples)
+            checked[function.key] = replace(function, body=body, examples=examples)
         self.check_termination(checked)
         return checked
 
@@ -284,20 +330,20 @@ class Checker:
         proved = set()
 
         def visit(function):
-            if function.name in proved:
+            if function.key in proved:
                 return
-            active.add(function.name)
+            active.add(function.key)
             for node in walk(function.body):
                 if not isinstance(node, Node) or node.kind != "invoke":
                     continue
                 name, _, _ = node.fields
                 if name in active:
                     raise LanguageError(node.token,
-                                        f"recursive call to '{name}' cannot guarantee termination")
+                                        f"recursive call to '{checked[name].name}' cannot guarantee termination")
                 if name in checked:
                     visit(checked[name])
-            active.remove(function.name)
-            proved.add(function.name)
+            active.remove(function.key)
+            proved.add(function.key)
 
         for function in checked.values():
             if "ending" in function.modifiers:
@@ -377,7 +423,7 @@ class Checker:
     def match_statement(self, node, flow):
         subject, arms = node.fields
         value = self.expression(subject, flow)
-        variants = self.enums.get(value.type.name)
+        variants = self.enums.get(value.type)
         if value.type.name == "result":
             variants = dict(zip(("Ok", "Err"), value.type.arguments))
         if variants is None:
@@ -462,7 +508,7 @@ class Checker:
             return self.list_expression(node, flow, expected)
         if kind == "field":
             record = self.expression(fields[0], flow)
-            signature = self.records.get(record.type.name)
+            signature = self.records.get(record.type)
             if signature is not None:
                 for index, field in enumerate(signature.parameters):
                     if field.name == node.token.text:
@@ -471,7 +517,8 @@ class Checker:
         if kind == "variant":
             name, expression = fields
             tag = node.token.text
-            variants = self.enums.get(name, {})
+            value_type = self.enum_names.get(name)
+            variants = self.enums.get(value_type, {})
             if tag not in variants:
                 raise LanguageError(node.token, f"unknown enum case '{name}::{tag}'")
             payload = variants[tag]
@@ -479,7 +526,7 @@ class Checker:
                 requirement = "cannot have" if payload is None else "needs"
                 raise LanguageError(node.token, f"'{name}::{tag}' {requirement} a payload")
             value = None if expression is None else self.expression(expression, flow, payload).node
-            return Checked(Type(name), Node(node.token, kind, (name, tag, value)))
+            return Checked(value_type, Node(node.token, kind, (value_type.name, tag, value)))
         if kind == "call":
             return self.call(node, flow, expected)
         if kind == "binary":
@@ -525,7 +572,7 @@ class Checker:
         hint = self.type_hint(node.fields, flow, None if equality else "int32") or INT
         base = hint.without_refinement()
         if base.name != "int32" and base not in {STRING, BOOL}:
-            variants = self.enums.get(base.name)
+            variants = self.enums.get(base)
             if variants is None or any(payload is not None for payload in variants.values()):
                 raise LanguageError(node.token, f"comparison is unavailable for {base}")
         left = self.expression(left_node, flow, base)
@@ -609,7 +656,7 @@ class Checker:
                 raise LanguageError(node.token, f"{name} needs an explicit result type")
             value = self.expression(arguments[0].expression, flow, expected.arguments[name == "Err"])
             return Checked(expected, Node(node.token, "result", (name, value.node)))
-        if name in self.records:
+        if name in self.record_names:
             return self.construct_record(node, name, flow)
         if flow.literals_only:
             if name in EXAMPLE_ERROR_MESSAGES:
@@ -617,7 +664,8 @@ class Checker:
             raise LanguageError(node.token, "example values must be literals; ordinary calls are not allowed")
         if name == "prepend":
             return self.prepend(node, flow, expected)
-        signature = self.functions.get(name) or HOST_FUNCTIONS.get(name) or PURE_FUNCTIONS.get(name)
+        signature = (self.functions.get(name) or self.imported_functions.get(name)
+                     or HOST_FUNCTIONS.get(name) or PURE_FUNCTIONS.get(name))
         if name in GENERIC_FUNCTIONS:
             signature = self.generic_signature(name, arguments, flow, expected)
         if signature is None:
@@ -645,13 +693,13 @@ class Checker:
         return Checked(Type(name), Node(node.token, "failure", (name, message)))
 
     def construct_record(self, node, name, flow):
-        signature = self.records[name]
+        signature = self.records[self.record_names[name]]
         if any(argument.label is None for argument in node.fields):
             raise LanguageError(node.token, f"'{name}' requires named fields")
         value = self.bind_arguments(node, name, signature, flow)
         _, plan, _ = value.node.fields
         fields = tuple(parameter.name for parameter in signature.parameters)
-        return Checked(signature.output, Node(node.token, "record", (name, fields, plan)))
+        return Checked(signature.output, Node(node.token, "record", (signature.output.name, fields, plan)))
 
     def prepend(self, node, flow, expected):
         candidates = []
@@ -757,7 +805,7 @@ class Checker:
             raise LanguageError(node.token, f"ambiguous call to '{name}'; name arguments for {labels}")
         resolved, plan = solutions[0]
         flow.nonzero = resolved.nonzero
-        return Checked(signature.output, Node(node.token, "invoke", (name, plan, group)))
+        return Checked(signature.output, Node(node.token, "invoke", (signature.key, plan, group)))
 
     def check_argument(self, argument, parameter, flow):
         if argument.mutable != parameter.mutable:

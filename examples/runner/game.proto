@@ -1,0 +1,268 @@
+// The console supplies a seed and keystrokes. Each run owns its own state.
+enum Tile { Ground, Gap, Barrier, Coin, AirCoin }
+enum Action { Wait, Jump, Quit }
+record Segment { tiles: list<Tile>, seed: int32 }
+record Track { tiles: list<Tile>, next: Segment, offset: int32 }
+
+export record Run { coins: int32, distance: int32 }
+export enum Outcome { Crash(Run), Abandoned }
+record State { track: Track, phase: int32, run: Run }
+enum Turn { Advance(State), Crash(Run) }
+record Pace { until: int32, delay: int32<ms> }
+
+pure ending fn increment(value: int32) -> int32 {
+    match value + 1 {
+        Ok(next) { return next; }
+        Err(overflow) { return value; }
+    }
+}
+
+pure ending fn segment(seed: int32) -> Segment {
+    let draw = pseudoRandom(state: seed, 0, 3);
+    // Every pattern leaves room to land before the next hazard.
+    let mut tiles = [
+        Tile::Ground, Tile::Ground, Tile::Coin, Tile::Ground,
+        Tile::Barrier, Tile::AirCoin, Tile::Ground, Tile::Ground,
+    ];
+    if draw.value == 1 {
+        tiles = [
+            Tile::Ground, Tile::Coin, Tile::Ground, Tile::Gap,
+            Tile::Gap, Tile::AirCoin, Tile::Ground, Tile::Ground,
+        ];
+    }
+    if draw.value == 2 {
+        tiles = [
+            Tile::Ground, Tile::Ground, Tile::Barrier, Tile::AirCoin,
+            Tile::Ground, Tile::Ground, Tile::Coin, Tile::Ground,
+        ];
+    }
+    if draw.value == 3 {
+        tiles = [
+            Tile::Ground, Tile::Ground, Tile::Coin, Tile::Ground,
+            Tile::Gap, Tile::AirCoin, Tile::Ground, Tile::Ground,
+        ];
+    }
+    return Segment(tiles: tiles, seed: draw.state);
+}
+
+pure ending fn start(seed: int32) -> State {
+    let tiles = [
+        Tile::Ground, Tile::Ground, Tile::Ground, Tile::Coin,
+        Tile::Ground, Tile::Ground, Tile::Coin, Tile::Ground,
+    ];
+    return State(track: Track(tiles: tiles, next: segment(seed), offset: 0),
+                 phase: 0, run: Run(coins: 0, distance: 0));
+}
+
+pure ending fn advance(track: Track) -> Track {
+    if track.offset == 7 {
+        return Track(tiles: track.next.tiles, next: segment(track.next.seed), offset: 0);
+    }
+    return Track(tiles: track.tiles, next: track.next, offset: increment(track.offset));
+}
+
+pure ending fn tileAt(track: Track, column: int32) -> Tile {
+    match track.offset + column {
+        Ok(index) {
+            match at(track.tiles, index) {
+                Ok(tile) { return tile; }
+                Err(outside) {
+                    match subtract(left: index, right: 8) {
+                        Ok(nextIndex) {
+                            match at(track.next.tiles, nextIndex) {
+                                Ok(tile) { return tile; }
+                                Err(outOfView) {}
+                            }
+                        }
+                        Err(overflow) {}
+                    }
+                }
+            }
+        }
+        Err(overflow) {}
+    }
+    return Tile::Ground;
+}
+
+pure ending fn nextPhase(phase: int32, jump: bool) -> int32 {
+    if phase == 0 {
+        if jump { return 1; }
+        return 0;
+    }
+    if phase == 4 { return 0; }
+    return increment(phase);
+}
+
+pure ending fn height(phase: int32) -> int32 {
+    if phase == 2 { return 2; }
+    if phase == 3 { return 2; }
+    if phase == 0 { return 0; }
+    return 1;
+}
+
+example "a gap ends a run at ground level" {
+    input tile: Tile::Gap;
+    input elevation: 0;
+    expect true;
+}
+example "a jump clears a barrier" {
+    input tile: Tile::Barrier;
+    input elevation: 1;
+    expect false;
+}
+pure deterministic ending fn hits(tile: Tile, elevation: int32) -> bool {
+    if elevation > 0 { return false; }
+    if tile == Tile::Gap { return true; }
+    return tile == Tile::Barrier;
+}
+
+pure ending fn collects(tile: Tile, elevation: int32) -> bool {
+    if elevation == 0 { return tile == Tile::Coin; }
+    return tile == Tile::AirCoin;
+}
+
+pure ending fn tick(state: State, jump: bool) -> Turn {
+    let track = advance(state.track);
+    let phase = nextPhase(state.phase, jump);
+    let elevation = height(phase);
+    let tile = tileAt(track, 0);
+    let distance = increment(state.run.distance);
+    let mut coins = state.run.coins;
+    if hits(tile, elevation) { return Turn::Crash(Run(coins: coins, distance: distance)); }
+    if collects(tile, elevation) { coins = increment(coins); }
+    return Turn::Advance(State(track: track, phase: phase, run: Run(coins: coins, distance: distance)));
+}
+
+example "the runner starts at two tiles per second" {
+    input distance: 0;
+    expect 500;
+}
+example "doubling a milestone raises speed by another half tile per second" {
+    input distance: 32;
+    expect 333;
+}
+pure deterministic ending fn tickDelay(distance: int32) -> int32<ms> {
+    // Increase by half a tile per second at each doubling, up to 6 tiles/s.
+    let bands = [
+        Pace(until: 16, delay: 500), Pace(until: 32, delay: 400),
+        Pace(until: 64, delay: 333), Pace(until: 128, delay: 286),
+        Pace(until: 256, delay: 250), Pace(until: 512, delay: 222),
+        Pace(until: 1024, delay: 200), Pace(until: 2048, delay: 182),
+    ];
+    for band in bands {
+        if distance < band.until { return band.delay; }
+    }
+    return 167;
+}
+
+pure ending fn action(keys: list<string>) -> Action {
+    let mut selected = Action::Wait;
+    for key in keys {
+        if key == "q" { return Action::Quit; }
+        if key == " " { selected = Action::Jump; }
+    }
+    return selected;
+}
+
+fn readAction(terminal: console, delay: int32<ms>, interactive: bool) -> result<Action, HostError> {
+    if interactive {
+        match readKeysFor(terminal, timeout: delay) {
+            Ok(keys) { return Ok(action(keys)); }
+            Err(error) {
+                if hostErrorKind(error) == HostErrorKind::EndOfInput { return Ok(Action::Quit); }
+                return Err(error);
+            }
+        }
+    }
+    match input(terminal) {
+        Ok(line) { return Ok(action([line])); }
+        Err(error) {
+            if hostErrorKind(error) == HostErrorKind::EndOfInput { return Ok(Action::Quit); }
+            return Err(error);
+        }
+    }
+}
+
+pure ending fn cell(tile: Tile, row: int32, player: bool) -> string {
+    if player { return " @ "; }
+    if row == -1 {
+        if tile == Tile::Gap { return "   "; }
+        return "===";
+    }
+    if row == 0 {
+        if tile == Tile::Barrier { return " # "; }
+        if tile == Tile::Coin { return " o "; }
+    }
+    if row == 1 {
+        if tile == Tile::AirCoin { return " o "; }
+    }
+    return "   ";
+}
+
+pure ending fn render(state: State, player: string) -> string {
+    let rows = [2, 1, 0, -1];
+    let columns = [0, 1, 2, 3, 4, 5, 6, 7, 8];
+    let elevation = height(state.phase);
+    let mut screen = concat(left: "Runner | ", right: player);
+    screen = concat(left: screen, right: " | Space jumps | q returns to menu\n");
+    for row in rows {
+        for column in columns {
+            let tile = tileAt(state.track, column);
+            let mut isPlayer = false;
+            if column == 0 { isPlayer = row == elevation; }
+            screen = concat(left: screen, right: cell(tile, row, player: isPlayer));
+        }
+        screen = concat(left: screen, right: "\n");
+    }
+    screen = concat(left: screen, right: concat(left: "Coins: ", right: formatInt32(state.run.coins)));
+    screen = concat(left: screen, right: concat(left: " | Distance: ", right: formatInt32(state.run.distance)));
+    return concat(left: screen, right: "\n");
+}
+
+fn show(terminal: console, state: State, player: string, interactive: bool) -> result<unit, HostError> {
+    let screen = render(state, player);
+    if interactive {
+        let frame = concat(left: "\u001b[H", right: concat(left: screen, right: "\u001b[J"));
+        return write(terminal, frame);
+    }
+    return write(terminal, screen);
+}
+
+fn playRound(terminal: console, player: string, seed: int32, interactive: bool) -> result<Outcome, HostError> {
+    let mut instructions = "Enter advances one tile | Space + Enter jumps | q + Enter returns to menu\n";
+    if interactive { instructions = "\u001b[2J"; }
+    match write(terminal, instructions) {
+        Ok(written) {}
+        Err(error) { return Err(error); }
+    }
+    let mut state = start(seed);
+    loop {
+        match show(terminal, state, player, interactive) {
+            Ok(written) {}
+            Err(error) { return Err(error); }
+        }
+        match readAction(terminal, delay: tickDelay(state.run.distance), interactive) {
+            Ok(request) {
+                if request == Action::Quit { return Ok(Outcome::Abandoned); }
+                match tick(state, jump: request == Action::Jump) {
+                    Advance(next) { state = next; }
+                    Crash(run) { return Ok(Outcome::Crash(run)); }
+                }
+            }
+            Err(error) { return Err(error); }
+        }
+    }
+}
+
+export fn play(terminal: console, player: string, seed: int32) -> result<Outcome, HostError> {
+    match enableKeyInput(terminal) {
+        Ok(interactive) {
+            let outcome = playRound(terminal, player, seed, interactive);
+            match disableKeyInput(terminal) {
+                Ok(restored) { return outcome; }
+                Err(error) { return Err(error); }
+            }
+        }
+        Err(error) { return Err(error); }
+    }
+}

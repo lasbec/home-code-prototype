@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import secrets
 from select import select
+from tempfile import NamedTemporaryFile
 from time import monotonic
 
 from .syntax import EXAMPLE_ERROR_MESSAGES
@@ -161,6 +162,14 @@ def enable_key_input(console):
         return Result("Err", Failure("TerminalModeError", str(error)))
 
 
+def disable_key_input(console):
+    try:
+        console.restore_key_input()
+        return Result("Ok", None)
+    except OSError as error:
+        return Result("Err", Failure("TerminalModeError", str(error)))
+
+
 def read_keys_for(console, timeout):
     if console._terminal_state is None:
         return Result("Err", Failure("InputError", "key input requires an enabled terminal"))
@@ -202,6 +211,27 @@ def write_file(filesystem, path, text):
         return Result("Ok", None)
     except (OSError, UnicodeError, ValueError) as error:
         return Result("Err", Failure("WriteError", str(error)))
+
+
+def replace_file(filesystem, path, text):
+    temporary = None
+    try:
+        destination = Path(path)
+        content = text.encode("utf-8")
+        with NamedTemporaryFile(dir=destination.parent, delete=False) as file:
+            temporary = Path(file.name)
+            file.write(content)
+        os.replace(temporary, destination)
+        temporary = None
+        return Result("Ok", None)
+    except (OSError, UnicodeError, ValueError) as error:
+        return Result("Err", Failure("WriteError", str(error)))
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def checked_int(value):
@@ -250,9 +280,11 @@ BUILTINS = {
     "write": write_text,
     "input": input_line,
     "enableKeyInput": enable_key_input,
+    "disableKeyInput": disable_key_input,
     "readKeysFor": read_keys_for,
     "readFileUTF8": read_file,
     "writeFileUTF8": write_file,
+    "replaceFileUTF8": replace_file,
     "random": random_int,
     "pseudoRandom": pseudo_random,
     "add": lambda left, right: checked_int(left + right),
@@ -299,7 +331,7 @@ class Interpreter:
                 mutable[parameter.name] = value
             arguments.append(value)
 
-        actual = self.call(function.name, arguments)
+        actual = self.call(function.key, arguments)
         expected = self.expression(example.output, {})
         if actual != expected:
             yield "return value", expected, actual

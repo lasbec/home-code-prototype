@@ -4,3 +4,4 @@ __pycache__/
 .idea/
 /prototype-output.txt
 /snake-scores.txt
+/runner-scores.txt

@@ -1,0 +1,133 @@
+// Three lines per player: name, coins, distance. The file holds each player's best run.
+export record Score { player: string, coins: int32, distance: int32 }
+
+pure ending fn better(candidate: Score, previous: Score) -> bool {
+    if candidate.coins != previous.coins { return candidate.coins > previous.coins; }
+    return candidate.distance > previous.distance;
+}
+
+example "keep the player's best run and use distance to break a coin tie" {
+    input history: [Score(player: "Ada", coins: 5, distance: 20),
+                    Score(player: "Ben", coins: 3, distance: 99)];
+    input candidate: Score(player: "Ben", coins: 5, distance: 24);
+    expect [Score(player: "Ben", coins: 5, distance: 24),
+            Score(player: "Ada", coins: 5, distance: 20)];
+}
+example "a longer run with fewer coins leaves the best score intact" {
+    input history: [Score(player: "Ada", coins: 5, distance: 20)];
+    input candidate: Score(player: "Ada", coins: 4, distance: 30);
+    expect [Score(player: "Ada", coins: 5, distance: 20)];
+}
+pure deterministic ending fn ranked(history: list<Score>, candidate: Score) -> list<Score> {
+    for previous in history {
+        if previous.player == candidate.player {
+            if better(candidate: candidate, previous: previous) == false { return history; }
+        }
+    }
+
+    let mut reversed: list<Score> = [];
+    let mut inserted = false;
+    for previous in history {
+        if previous.player != candidate.player {
+            if inserted == false {
+                if better(candidate: candidate, previous: previous) {
+                    reversed = prepend(candidate, reversed);
+                    inserted = true;
+                }
+            }
+            reversed = prepend(previous, reversed);
+        }
+    }
+    if inserted == false { reversed = prepend(candidate, reversed); }
+
+    let mut ordered: list<Score> = [];
+    for score in reversed { ordered = prepend(score, ordered); }
+    return ordered;
+}
+
+enum Field { Name, Coins, Distance }
+
+example "an incomplete score is reported" {
+    input text: "Ada\n10\n";
+    expect Err("The score file ends in the middle of a score.");
+}
+pure deterministic ending fn parse(text: string) -> result<list<Score>, string> {
+    let lines = splitLines(text);
+    let mut history: list<Score> = [];
+    let mut field = Field::Name;
+    let mut player = "";
+    let mut coins = 0;
+    for line in lines {
+        match field {
+            Name {
+                if line == "" { return Err("The score file has an empty name."); }
+                player = line;
+                field = Field::Coins;
+            }
+            Coins {
+                match parseInt32(line) {
+                    Ok(value) {
+                        if value < 0 { return Err("The score file has a negative coin count."); }
+                        coins = value;
+                        field = Field::Distance;
+                    }
+                    Err(error) { return Err("The score file has an invalid coin count."); }
+                }
+            }
+            Distance {
+                match parseInt32(line) {
+                    Ok(value) {
+                        if value < 0 { return Err("The score file has a negative distance."); }
+                        let score = Score(player: player, coins: coins, distance: value);
+                        history = ranked(history: history, candidate: score);
+                        field = Field::Name;
+                    }
+                    Err(error) { return Err("The score file has an invalid distance."); }
+                }
+            }
+        }
+    }
+    if field != Field::Name { return Err("The score file ends in the middle of a score."); }
+    return Ok(history);
+}
+
+pure ending fn line(text: string, value: string) -> string {
+    return concat(left: text, right: concat(left: value, right: "\n"));
+}
+
+pure ending fn serialize(history: list<Score>) -> string {
+    let mut text = "";
+    for score in history {
+        text = line(text: text, value: score.player);
+        text = line(text: text, value: formatInt32(score.coins));
+        text = line(text: text, value: formatInt32(score.distance));
+    }
+    return text;
+}
+
+export fn loadScores(files: filesystem, path: string) -> result<list<Score>, string> {
+    match readFileUTF8(files, path) {
+        Ok(text) { return parse(text); }
+        Err(error) {
+            if hostErrorKind(error) == HostErrorKind::FileNotFound { return Ok([]); }
+            return Err(describeHostError(error));
+        }
+    }
+}
+
+export fn saveScore(files: filesystem, path: string, score: Score) -> string {
+    match loadScores(files, path) {
+        Ok(history) {
+            let updated = ranked(history: history, candidate: score);
+            let text = serialize(updated);
+            if text == serialize(history) { return "Your best score still stands."; }
+            match replaceFileUTF8(files, path: path, text: text) {
+                Ok(written) { return "Best score saved."; }
+                Err(error) {
+                    return concat(left: "Score could not be saved: ", right: describeHostError(error));
+                }
+            }
+        }
+        Err(error) { return concat(left: "Score could not be saved: ", right: error); }
+    }
+}

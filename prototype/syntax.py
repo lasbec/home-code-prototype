@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 import json
 import math
+from pathlib import Path
 import re
 
 
@@ -12,6 +13,7 @@ class Token:
     line: int
     column: int
     kind: str = ""
+    source: str | None = None
 
 
 class LanguageError(Exception):
@@ -26,9 +28,11 @@ class Type:
     arguments: tuple = ()
     units: tuple = ()
     nonzero: bool = False
+    module: str | None = None
 
     def __str__(self):
-        name = self.name + ("!0" if self.nonzero else "")
+        name = self.name if self.module is None else f"{Path(self.module).stem}.{self.name}"
+        name += "!0" if self.nonzero else ""
         if self.arguments:
             return f"{name}<{', '.join(map(str, self.arguments))}>"
         if not self.units:
@@ -41,10 +45,10 @@ class Type:
         return f"{name}<{units}>"
 
     def without_refinement(self):
-        return Type(self.name, self.arguments, self.units)
+        return Type(self.name, self.arguments, self.units, module=self.module)
 
     def refined(self):
-        return Type(self.name, self.arguments, self.units, nonzero=True)
+        return Type(self.name, self.arguments, self.units, nonzero=True, module=self.module)
 
 
 BOOL = Type("bool")
@@ -129,10 +133,16 @@ class Function:
     body: tuple = ()
     commutative: tuple = ()
     examples: tuple = ()
+    exported: bool = False
+    module: str | None = None
 
     @property
     def name(self):
         return self.token.text
+
+    @property
+    def key(self):
+        return self.name if self.module is None else (self.module, self.name)
 
     @property
     def commutative_slots(self):
@@ -146,12 +156,14 @@ class Function:
 class RecordDeclaration:
     token: Token
     fields: tuple
+    exported: bool = False
 
 
 @dataclass(frozen=True)
 class EnumDeclaration:
     token: Token
     variants: tuple
+    exported: bool = False
 
 
 @dataclass(frozen=True)
@@ -162,25 +174,26 @@ class Argument:
     mutable: bool = False
 
 
+NAME_PATTERN = r"[A-Za-z_][A-Za-z_0-9]*"
 TOKEN = re.compile(
     r'(?P<skip>\s+|//[^\n]*)|(?P<string>"(?:[^"\\\n]|\\[^\n])*")|'
     r'(?P<decimal>[0-9]+(?:\.[0-9]+(?:[eE][+-]?[0-9]+)?|[eE][+-]?[0-9]+))|'
-    r'(?P<integer>[0-9]+)|(?P<name>[A-Za-z_][A-Za-z_0-9]*)|'
+    rf'(?P<integer>[0-9]+)|(?P<name>{NAME_PATTERN})|'
     r'(?P<punct>!0|->|::|==|!=|<=|>=|[{}()\[\],.:;=<>+*/-])|(?P<invalid>.)'
 )
 RESERVED = MODIFIERS | {
     "fn", "mut", "let", "as", "return", "if", "else", "for", "in",
-    "match", "true", "false", "unit", "record", "enum", "loop",
+    "match", "true", "false", "unit", "record", "enum", "loop", "import", "export",
 }
 PRECEDENCE = {"as": 0, "==": 1, "!=": 1, "<": 1, ">": 1, "<=": 1,
               ">=": 1, "+": 2, "-": 2, "*": 3, "/": 3}
 
 
-def tokenize(source):
+def tokenize(source, filename=None):
     line, column = 1, 1
     for match in TOKEN.finditer(source):
         value = match.group()
-        token = Token(value, line, column, match.lastgroup)
+        token = Token(value, line, column, match.lastgroup, filename)
         if token.kind == "invalid":
             raise LanguageError(token, f"unexpected character {value!r}")
         if token.kind != "skip":
@@ -191,7 +204,7 @@ def tokenize(source):
             column = len(value.rsplit("\n", 1)[1]) + 1
         else:
             column += len(value)
-    yield Token("<end of file>", line, column)
+    yield Token("<end of file>", line, column, source=filename)
 
 
 def decode_string(token):
@@ -204,18 +217,19 @@ def decode_string(token):
 
 
 class Parser:
-    def __init__(self, source):
-        self.tokens = list(tokenize(source))
+    def __init__(self, source, *, filename=None, module=None):
+        self.tokens = list(tokenize(source, filename))
         self.index = 0
-        self.data_types = set()
+        self.data_types = {}
         depth = 0
         for index, token in enumerate(self.tokens):
-            if token.text == "{":
+            if token.kind == "punct" and token.text == "{":
                 depth += 1
-            elif token.text == "}":
+            elif token.kind == "punct" and token.text == "}":
                 depth -= 1
-            elif not depth and token.text in {"record", "enum"}:
-                self.data_types.add(self.tokens[index + 1].text)
+            elif not depth and token.kind == "name" and token.text in {"record", "enum"}:
+                name = self.tokens[index + 1].text
+                self.data_types[name] = Type(name, module=module)
 
     @property
     def current(self):
@@ -244,22 +258,37 @@ class Parser:
             raise LanguageError(token, f"expected a name, found {token.text!r}")
         return token
 
+    def imports(self):
+        while self.accept("import"):
+            path = self.take()
+            if path.kind != "string":
+                raise LanguageError(path, "expected a quoted import path")
+            self.accept(";")
+            yield path, decode_string(path)
+
+    def qualified_name(self, token):
+        if not self.accept("."):
+            return token
+        member = self.name()
+        return Token(f"{token.text}.{member.text}", token.line, token.column, token.kind, token.source)
+
     def program(self):
         declarations = []
         while self.current.kind:
-            if self.accept("record"):
-                name = self.name()
-                self.expect("{")
-                declarations.append(RecordDeclaration(name, self.separated("}", self.record_field)))
-                continue
-            if self.accept("enum"):
-                name = self.name()
-                self.expect("{")
-                declarations.append(EnumDeclaration(name, self.separated("}", self.variant)))
-                continue
             examples = []
             while self.current.text == "example":
                 examples.append(self.example())
+            exported = bool(self.accept("export"))
+            if not examples and self.accept("record"):
+                name = self.name()
+                self.expect("{")
+                declarations.append(RecordDeclaration(name, self.separated("}", self.record_field), exported))
+                continue
+            if not examples and self.accept("enum"):
+                name = self.name()
+                self.expect("{")
+                declarations.append(EnumDeclaration(name, self.separated("}", self.variant), exported))
+                continue
             modifiers = set()
             commutative = []
             while self.current.text in MODIFIERS:
@@ -277,7 +306,7 @@ class Parser:
             self.expect("->")
             output = self.type()
             declarations.append(Function(name, frozenset(modifiers), parameters, output,
-                                         self.block(), tuple(commutative), tuple(examples)))
+                                         self.block(), tuple(commutative), tuple(examples), exported))
         return tuple(declarations)
 
     def example(self):
@@ -327,7 +356,7 @@ class Parser:
         return name, payload
 
     def type(self):
-        token = self.take()
+        token = self.qualified_name(self.take())
         name = token.text
         if name in SIMPLE_TYPES:
             return Type(name)
@@ -350,7 +379,7 @@ class Parser:
             units = self.units() if self.accept("<") else ()
             return Type(name, units=units, nonzero=bool(nonzero))
         if name in self.data_types:
-            return Type(name)
+            return self.data_types[name]
         raise LanguageError(token, f"unknown type '{name}'")
 
     def units(self):
@@ -469,6 +498,9 @@ class Parser:
         if token.text == "unit":
             return Node(token, "value", (None, UNIT))
         if token.kind == "name" and token.text not in RESERVED:
+            if (self.current.text == "." and self.index + 2 < len(self.tokens)
+                    and self.tokens[self.index + 2].text in {"(", "::"}):
+                token = self.qualified_name(token)
             if self.accept("::"):
                 tag = self.name()
                 payload = None

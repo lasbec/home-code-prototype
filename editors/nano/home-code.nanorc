@@ -2,7 +2,7 @@
 syntax home-code "/home-code-prototype/.*\.proto$"
 comment "//"
 
-color brightcyan "\<(as|else|enum|fn|for|if|in|let|loop|match|mut|record|return)\>"
+color brightcyan "\<(as|else|enum|export|fn|for|if|import|in|let|loop|match|mut|record|return)\>"
 color brightcyan "\<(commutative|deterministic|pure|ending)\>"
 # Highlight example entries while leaving calls such as input(console) alone.
 color brightcyan "\<(example|expect)\>" "\<(input|after)\>[[:blank:]]"

@@ -6,22 +6,24 @@ from pathlib import Path
 import signal
 import sys
 
-from .checker import Checker
+from .modules import ModuleLoader
 from .runtime import Console, Filesystem, Interpreter, RandomSource, display
-from .syntax import LanguageError, Parser
+from .syntax import LanguageError
 
 
 def terminate(signum, _frame):
     raise SystemExit(128 + signum)
 
 
-def run_examples(source, program):
-    interpreter = Interpreter(program)
+def run_examples(program, recursive):
+    interpreter = Interpreter(program.functions)
     passed = failed = 0
-    for function in program.values():
+    for function in program.functions.values():
+        if not recursive and function.module != program.entry:
+            continue
         for example in function.examples:
             token = example.token
-            location = f"{source}:{token.line}:{token.column}"
+            location = f"{token.source}:{token.line}:{token.column}"
             label = f"example for '{function.name}'"
             if example.description is not None:
                 label += f" {display(example.description, literal=True)}"
@@ -49,6 +51,7 @@ def main():
     check.add_argument("source", type=Path)
     test = commands.add_parser("test", help="validate and run attached examples")
     test.add_argument("source", type=Path)
+    test.add_argument("-r", action="store_true", help="also test transitively imported files")
     run = commands.add_parser("run", help="validate and run main")
     run.add_argument("source", type=Path)
     run.add_argument("--console", action="store_true", help="pass live standard input and output")
@@ -56,13 +59,12 @@ def main():
     run.add_argument("--random", action="store_true", help="pass access to secure host randomness")
     args = cli.parse_args()
     try:
-        source = args.source.read_text(encoding="utf-8")
-        program = Checker(Parser(source).program()).program()
+        program = ModuleLoader().load(args.source)
     except LanguageError as error:
         token = error.token
-        print(f"{args.source}:{token.line}:{token.column}: {error}", file=sys.stderr)
+        print(f"{token.source or args.source}:{token.line}:{token.column}: {error}", file=sys.stderr)
         return 1
-    except (OSError, UnicodeError) as error:
+    except (OSError, ValueError, RuntimeError) as error:
         print(f"{args.source}: {error}", file=sys.stderr)
         return 1
     if args.command == "check":
@@ -70,11 +72,11 @@ def main():
         return 0
     if args.command == "test":
         try:
-            return run_examples(args.source, program)
+            return run_examples(program, args.r)
         except KeyboardInterrupt:
             return 130
 
-    entry = program.get("main")
+    entry = program.functions.get((program.entry, "main"))
     if entry is None:
         cli.error("run requires a main function")
     capabilities = {}
@@ -96,7 +98,7 @@ def main():
                 previous = signal.signal(signal.SIGTERM, terminate)
                 cleanup.callback(signal.signal, signal.SIGTERM, previous)
                 cleanup.callback(capabilities["console"].restore_key_input)
-            value = Interpreter(program).call("main", arguments)
+            value = Interpreter(program.functions).call(entry.key, arguments)
     except KeyboardInterrupt:
         return 130
     except RecursionError:
