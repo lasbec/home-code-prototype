@@ -92,7 +92,7 @@ EXAMPLE_ERROR_MESSAGES = {
 GUARANTEES = frozenset({"ending", "deterministic", "pure"})
 MODIFIERS = GUARANTEES | {"commutative"}
 SIMPLE_TYPES = (
-    CAPABILITIES.keys() | {"Capacity", "Empty"} | {
+    CAPABILITIES.keys() | {"Capacity", "Empty", "Never"} | {
         item.name for item in (BOOL, STRING, UNIT, RANDOM_DRAW, KILLED,
                                OVERFLOW, ZERO, INDEX_ERROR, HOST_ERROR, HOST_ERROR_KIND, PARSE_INT_ERROR)
     }

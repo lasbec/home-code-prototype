@@ -6,11 +6,11 @@ Two green threads can exchange a message through a bounded channel while other r
 
 **Blocked by** [03](03-start-and-join-green-threads.md), [04](04-use-nonblocking-channels.md)
 
-**Status** ready-for-agent
+**Status** done
 
 ## Acceptance criteria
 
-- [ ] On a full buffer, `send_blocking` parks the sender. On an empty buffer, `receive_blocking` parks the receiver. A completed ordinary receive returns `T`.
-- [ ] A send or receive wakes the oldest eligible waiter. A later nonblocking operation cannot overtake an eligible waiter.
-- [ ] Shared handles can be used both as task arguments and as messages between tasks. FIFO buffer and waiter behavior is reproducible.
-- [ ] A program with only blocked channel operations reports deadlock when no event can make progress.
+- [x] On a full buffer, `send_blocking` parks the sender. On an empty buffer, `receive_blocking` parks the receiver. A completed ordinary receive returns `T`.
+- [x] A send or receive wakes the oldest eligible waiter. A later nonblocking operation cannot overtake an eligible waiter.
+- [x] Shared handles can be used both as task arguments and as messages between tasks. FIFO buffer and waiter behavior is reproducible.
+- [x] A program with only blocked channel operations reports deadlock when no event can make progress.
