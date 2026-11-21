@@ -19,11 +19,21 @@ class Program:
         return self.mock.literal(parser.literal(), self.mock.state_type)
 
 
+@dataclass(frozen=True)
+class ParsedModule:
+    parser: Parser
+    imports: tuple
+    declarations: tuple
+    checker: Checker
+
+
 class ModuleLoader:
-    def __init__(self):
+    def __init__(self, *, capture=False, root=None):
         self.active = []
         self.scopes = {}
         self.checked = {}
+        self.sources = {} if capture else None
+        self.root = root
 
     def load(self, source):
         path = source.resolve()
@@ -37,6 +47,8 @@ class ModuleLoader:
         try:
             if path is None:
                 path = source.resolve()
+            if self.root is not None and not path.is_relative_to(self.root):
+                raise ValueError(f"module is outside the program directory: {path}")
             if path in self.active:
                 cycle = self.active[self.active.index(path):] + [path]
                 chain = " -> ".join(item.name for item in cycle)
@@ -54,7 +66,8 @@ class ModuleLoader:
 
         self.active.append(path)
         self.checked[path] = {}
-        parser = Parser(contents, filename=str(source), module=str(path))
+        capture = self.sources is not None
+        parser = Parser(contents, filename=str(source), module=str(path), capture=capture)
         mock = parser.mock_header()
         if mock and import_token:
             raise LanguageError(import_token, "mock files cannot be imported")
@@ -63,6 +76,7 @@ class ModuleLoader:
         if mock and parser.current.text == "import":
             raise LanguageError(parser.current, "mock files cannot import other files")
         imports = {}
+        edges = []
         for token, text in parser.imports():
             relative = Path(text)
             if relative.is_absolute() or relative.suffix != ".proto":
@@ -72,15 +86,21 @@ class ModuleLoader:
                 raise LanguageError(token, f"'{namespace}' is not a valid import namespace")
             if namespace in imports:
                 raise LanguageError(token, f"duplicate import namespace '{namespace}'")
-            dependency = self.visit(path.parent / relative, import_token=token)
+            location = path.parent / relative
+            dependency = self.visit(location, import_token=token)
             imports[namespace] = dependency
+            if capture:
+                edges.append((token, text, namespace, location.resolve()))
             parser.data_types.update({
                 f"{namespace}.{name}": value_type for name, value_type in dependency.public_types.items()
             })
 
-        scope = Checker(parser.program(), module=str(path), imports=imports,
-                        entry=import_token is None, mock=mock)
+        declarations = parser.program()
+        scope = Checker(declarations, module=str(path), imports=imports,
+                        entry=import_token is None, mock=mock, capture=capture)
         self.checked[path] = scope.program()
+        if capture:
+            self.sources[path] = ParsedModule(parser, tuple(edges), declarations, scope)
         self.scopes[path] = scope
         self.active.pop()
         return scope

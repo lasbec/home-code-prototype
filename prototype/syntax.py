@@ -177,7 +177,7 @@ class Argument:
 
 NAME_PATTERN = r"[A-Za-z_][A-Za-z_0-9]*"
 TOKEN = re.compile(
-    r'(?P<skip>\s+|//[^\n]*)|(?P<string>"(?:[^"\\\n]|\\[^\n])*")|'
+    r'(?P<skip>\s+)|(?P<comment>//[^\n]*)|(?P<string>"(?:[^"\\\n]|\\[^\n])*")|'
     r'(?P<decimal>[0-9]+(?:\.[0-9]+(?:[eE][+-]?[0-9]+)?|[eE][+-]?[0-9]+))|'
     rf'(?P<integer>[0-9]+)|(?P<name>{NAME_PATTERN})|'
     r'(?P<punct>!0|->|::|==|!=|<=|>=|[{}()\[\],.:;=<>+*/-])|(?P<invalid>.)'
@@ -190,14 +190,17 @@ PRECEDENCE = {"as": 0, "==": 1, "!=": 1, "<": 1, ">": 1, "<=": 1,
               ">=": 1, "+": 2, "-": 2, "*": 3, "/": 3}
 
 
-def tokenize(source, filename=None):
+def tokenize(source, filename=None, *, comments=None):
     line, column = 1, 1
     for match in TOKEN.finditer(source):
         value = match.group()
         token = Token(value, line, column, match.lastgroup, filename)
         if token.kind == "invalid":
             raise LanguageError(token, f"unexpected character {value!r}")
-        if token.kind != "skip":
+        if token.kind == "comment":
+            if comments is not None:
+                comments.append(token)
+        elif token.kind != "skip":
             yield token
         newlines = value.count("\n")
         if newlines:
@@ -218,8 +221,11 @@ def decode_string(token):
 
 
 class Parser:
-    def __init__(self, source, *, filename=None, module=None):
-        self.tokens = list(tokenize(source, filename))
+    def __init__(self, source, *, filename=None, module=None, capture=False):
+        self.comments = [] if capture else None
+        self.tokens = list(tokenize(source, filename, comments=self.comments))
+        self.type_angles = set()
+        self.line_breaks = set()
         self.index = 0
         self.data_types = {}
         self.mock = None
@@ -266,6 +272,8 @@ class Parser:
             if path.kind != "string":
                 raise LanguageError(path, "expected a quoted import path")
             self.accept(";")
+            if self.comments is not None:
+                self.line_breaks.add(self.index - 1)
             yield path, decode_string(path)
 
     def mock_header(self):
@@ -274,6 +282,8 @@ class Parser:
             if environment.text not in CAPABILITIES:
                 raise LanguageError(environment, f"unknown mock environment '{environment.text}'")
             self.mock = environment
+            if self.comments is not None:
+                self.line_breaks.add(self.index - 1)
         return self.mock
 
     def qualified_name(self, token):
@@ -378,26 +388,34 @@ class Parser:
         if name in SIMPLE_TYPES:
             return Type(name)
         if name == "list":
-            self.expect("<")
+            self.type_angle("<")
             element = self.type()
-            self.expect(">")
+            self.type_angle(">")
             return Type(name, (element,))
         if name == "result":
-            self.expect("<")
+            self.type_angle("<")
             value = self.type()
             self.expect(",")
             error = self.type()
-            self.expect(">")
+            self.type_angle(">")
             return result_type(value, error)
         if name in {"int32", "f64"}:
             nonzero = self.accept("!0")
             if name == "f64" and nonzero:
                 raise LanguageError(nonzero, "only int32 supports !0 in this prototype")
-            units = self.units() if self.accept("<") else ()
+            units = ()
+            if self.current.text == "<":
+                self.type_angle("<")
+                units = self.units()
             return Type(name, units=units, nonzero=bool(nonzero))
         if name in self.data_types:
             return self.data_types[name]
         raise LanguageError(token, f"unknown type '{name}'")
+
+    def type_angle(self, text):
+        if self.comments is not None:
+            self.type_angles.add(self.index)
+        self.expect(text)
 
     def units(self):
         powers = {}
@@ -408,7 +426,8 @@ class Parser:
                 powers[token.text] = powers.get(token.text, 0) + sign
             elif token.text != "1":
                 raise LanguageError(token, "expected a unit name or 1")
-            if self.accept(">"):
+            if self.current.text == ">":
+                self.type_angle(">")
                 return tuple(sorted((unit, power) for unit, power in powers.items() if power))
             operator = self.take()
             if operator.text not in {"*", "/"}:

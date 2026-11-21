@@ -4,12 +4,14 @@ import argparse
 from contextlib import ExitStack
 from pathlib import Path
 import signal
+import sqlite3
 import sys
 
 from .modules import ModuleLoader
 from .runtime import (
     Cell, Console, Filesystem, Interpreter, MockCapability, RandomSource, display, write_atomic,
 )
+from .snapshot import export_program, save_program
 from .syntax import CAPABILITIES, UNIT, LanguageError
 
 
@@ -115,7 +117,7 @@ def load_mocks(args, cli):
 
 
 def main():
-    cli = argparse.ArgumentParser(description="Check, test, or run a program in the language prototype.")
+    cli = argparse.ArgumentParser(description="Check, test, run, or snapshot a program in the language prototype.")
     commands = cli.add_subparsers(dest="command", required=True)
     check = commands.add_parser("check", help="validate a source file without running it")
     check.add_argument("source", type=Path)
@@ -123,6 +125,12 @@ def main():
     test = commands.add_parser("test", help="validate and run attached examples")
     test.add_argument("source", type=Path)
     test.add_argument("-r", action="store_true", help="also test transitively imported files")
+    save = commands.add_parser("save", help="check a program and save it to SQLite")
+    save.add_argument("source", type=Path)
+    save.add_argument("database", type=Path)
+    export = commands.add_parser("export", help="regenerate .proto files from a program database")
+    export.add_argument("database", type=Path)
+    export.add_argument("directory", type=Path)
     run = commands.add_parser("run", help="validate and run main")
     run.add_argument("source", type=Path)
     for environment in CAPABILITIES:
@@ -131,6 +139,18 @@ def main():
         run.add_argument(f"--_{environment}-mock", action="append", type=Path, help=argparse.SUPPRESS)
     add_state_options(run, output=True)
     args = cli.parse_args(cli_arguments(sys.argv[1:]))
+    if args.command in {"save", "export"}:
+        source = args.source if args.command == "save" else args.database
+        try:
+            if args.command == "save":
+                save_program(source, args.database)
+                print(args.database)
+            else:
+                print(export_program(source, args.directory))
+        except (LanguageError, OSError, ValueError, RuntimeError, sqlite3.Error) as error:
+            report_error(source, error)
+            return 1
+        return 0
     try:
         program = ModuleLoader().load(args.source)
     except (LanguageError, OSError, ValueError, RuntimeError) as error:

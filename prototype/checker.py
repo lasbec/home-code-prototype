@@ -112,6 +112,7 @@ class Flow:
 class Checked:
     type: Type
     node: Node
+    call: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -151,7 +152,8 @@ def merge_proofs(flow, branches):
 
 
 class Checker:
-    def __init__(self, declarations, *, module=None, imports=None, entry=True, mock=None):
+    def __init__(self, declarations, *, module=None, imports=None, entry=True, mock=None, capture=False):
+        self.facts = [] if capture else None
         self.mock_header = mock
         self.mock_operations = {} if mock is None else {
             name: function for name, function in HOST_FUNCTIONS.items()
@@ -306,7 +308,22 @@ class Checker:
             checked[function.key] = replace(function, body=body, examples=examples)
         self.check_termination(checked)
         self.check_mutations(checked)
+        if self.facts is not None:
+            retained = set()
+            for function in checked.values():
+                roots = [function.body]
+                for example in function.examples:
+                    roots.extend((example.inputs, example.output, example.after))
+                retained.update(id(node) for node in walk(tuple(roots)))
+            self.facts = [(token, kind, value) for owner, token, kind, value in self.facts
+                          if id(owner) in retained]
         return checked
+
+    def remember(self, owner, token, kind, value):
+        # Speculative checks can produce different facts for the same source token.
+        # Keep the owners alive and publish only facts from the selected lowered tree.
+        if self.facts is not None:
+            self.facts.append((owner, token, kind, value))
 
     def check_mutations(self, checked):
         parameters = {
@@ -373,6 +390,7 @@ class Checker:
             if name in values:
                 raise LanguageError(entry.parameter, f"duplicate '{kind}' entry for '{name}'")
             values[name] = self.expression(entry.value, flow, parameter.type).node
+            self.remember(values[name], entry.parameter, "local_reference", parameter.token)
 
         for parameter in function.parameters:
             name = parameter.name
@@ -450,6 +468,7 @@ class Checker:
 
     def statement(self, node, flow):
         kind, fields = node.kind, node.fields
+        facts = []
         if kind == "let":
             name, declared, mutable, expression = fields
             value = self.expression(expression, flow, declared)
@@ -457,6 +476,7 @@ class Checker:
             if value.type.nonzero:
                 flow.nonzero.add(name.text)
             lowered = (name, value.node, mutable)
+            facts.append((name, "local_type", flow.bindings[name.text].type))
         elif kind == "assign":
             name, expression = fields
             binding = self.writable(flow, name, name.text)
@@ -465,6 +485,7 @@ class Checker:
             if value.type.nonzero:
                 flow.nonzero.add(name.text)
             lowered = (binding.token, value.node)
+            facts.append((name, "local_reference", binding.token))
         elif kind == "return":
             value = self.expression(fields[0], flow, self.current_function.output)
             return Node(node.token, kind, (value.node,)), True
@@ -493,6 +514,8 @@ class Checker:
             lowered_body = self.loop_body(body, loop)
             flow.nonzero = loop.nonzero
             lowered = (item.text, Node(source, "variable", (source.text,)), lowered_body)
+            facts.extend(((item, "local_type", loop.bindings[item.text].type),
+                          (source, "local_reference", binding.token)))
         elif kind == "loop":
             if "ending" in self.current_function.modifiers:
                 raise LanguageError(node.token, "an unbounded loop cannot guarantee termination")
@@ -500,7 +523,10 @@ class Checker:
             return Node(node.token, kind, (lowered_body,)), True
         else:
             raise AssertionError(kind)
-        return Node(node.token, kind, lowered), False
+        result = Node(node.token, kind, lowered)
+        for token, fact, value in facts:
+            self.remember(result, token, fact, value)
+        return result, False
 
     def loop_body(self, body, flow):
         # A proof at the loop head must hold on entry and on every backedge.
@@ -540,7 +566,12 @@ class Checker:
         if missing:
             raise LanguageError(node.token, f"match is missing arm(s): {', '.join(sorted(missing))}")
         merge_proofs(flow, branches)
-        return Node(node.token, node.kind, (value.node, lowered)), all(ends for _, ends in branches)
+        result = Node(node.token, node.kind, (value.node, lowered))
+        for tag, binding, _ in arms:
+            self.remember(result, tag, "case_reference", (value.type, tag.text))
+            if binding is not None:
+                self.remember(result, binding, "local_type", variants[tag.text])
+        return result, all(ends for _, ends in branches)
 
     def narrow(self, condition, yes, no):
         if condition.kind != "binary" or condition.token.text not in {"==", "!="}:
@@ -565,6 +596,14 @@ class Checker:
         checked = self.infer(node, flow, expected)
         if not compatible(checked.type, expected):
             raise LanguageError(node.token, f"expected {expected}, found {checked.type}")
+        self.remember(checked.node, node.token, "expression_type", checked.type)
+        if checked.call is not None:
+            _, bindings = checked.call
+            self.remember(checked.node, node.token, "call", checked.call)
+            if node.kind == "call":
+                for argument, (_, _, reference) in zip(node.fields, bindings):
+                    if reference is not None:
+                        self.remember(checked.node, argument.expression.token, "local_reference", reference)
         return checked
 
     def literal(self, node, expected):
@@ -590,8 +629,10 @@ class Checker:
             name, = fields
             if name not in flow.bindings and (name in self.functions or name in BUILTIN_NAMES):
                 raise LanguageError(node.token, "a function cannot be used as a data value")
-            flow.require(node.token, name)
-            return Checked(flow.type_of(name), node)
+            binding = flow.require(node.token, name)
+            lowered = replace(node) if self.facts is not None else node
+            self.remember(lowered, node.token, "local_reference", binding.token)
+            return Checked(flow.type_of(name), lowered)
         if kind == "as":
             expression, annotation = fields
             if expression.kind == "binary" and expression.token.text == "/":
@@ -606,7 +647,9 @@ class Checker:
             if signature is not None:
                 for index, field in enumerate(signature.parameters):
                     if field.name == node.token.text:
-                        return Checked(field.type, Node(node.token, kind, (record.node, index)))
+                        lowered = Node(node.token, kind, (record.node, index))
+                        self.remember(lowered, node.token, "field_reference", (record.type, field.name))
+                        return Checked(field.type, lowered)
             raise LanguageError(node.token, f"{record.type} has no field '{node.token.text}'")
         if kind == "variant":
             name, expression = fields
@@ -620,7 +663,9 @@ class Checker:
                 requirement = "cannot have" if payload is None else "needs"
                 raise LanguageError(node.token, f"'{name}::{tag}' {requirement} a payload")
             value = None if expression is None else self.expression(expression, flow, payload).node
-            return Checked(value_type, Node(node.token, kind, (value_type.name, tag, value)))
+            lowered = Node(node.token, kind, (value_type.name, tag, value))
+            self.remember(lowered, node.token, "case_reference", (value_type, tag))
+            return Checked(value_type, lowered)
         if kind == "call":
             return self.call(node, flow, expected)
         if kind == "binary":
@@ -709,7 +754,9 @@ class Checker:
         derived = Type("f64", units=quotient_units(left.type.units, right.type.units))
         if derived != annotation:
             raise LanguageError(node.token, f"division produces {derived}, found annotation {annotation}")
-        return Checked(annotation, Node(node.token, "binary", (left.node, right.node, False)))
+        lowered = Node(node.token, "binary", (left.node, right.node, False))
+        self.remember(lowered, node.token, "expression_type", annotation)
+        return Checked(annotation, lowered)
 
     def generic_signature(self, name, arguments, flow, expected):
         if name in {"at", "dropLast"}:
@@ -749,13 +796,14 @@ class Checker:
             if expected is None or expected.name != "result":
                 raise LanguageError(node.token, f"{name} needs an explicit result type")
             value = self.expression(arguments[0].expression, flow, expected.arguments[name == "Err"])
-            return Checked(expected, Node(node.token, "result", (name, value.node)))
+            call = (name, (("value", False, None),)) if self.facts is not None else None
+            return Checked(expected, Node(node.token, "result", (name, value.node)), call)
         if name in self.record_names:
             return self.construct_record(node, name, flow)
         if self.mock_header and name == HOST_ERROR.name:
             value = self.bind_arguments(node, name, HOST_ERROR_CONSTRUCTOR, flow)
             _, plan, _ = value.node.fields
-            return Checked(HOST_ERROR, Node(node.token, "host_failure", (plan,)))
+            return Checked(HOST_ERROR, Node(node.token, "host_failure", (plan,)), value.call)
         if flow.literal_context:
             if name in EXAMPLE_ERROR_MESSAGES:
                 return self.example_error(node, flow)
@@ -793,7 +841,9 @@ class Checker:
             if len(arguments) != 1 or arguments[0].mutable or arguments[0].label is not None:
                 raise LanguageError(node.token, f"{name} takes one unnamed string literal in an example")
             message = self.expression(arguments[0].expression, flow, STRING).node
-        return Checked(Type(name), Node(node.token, "failure", (name, message)))
+        bindings = () if message is None else (("message", False, None),)
+        call = (name, bindings) if self.facts is not None else None
+        return Checked(Type(name), Node(node.token, "failure", (name, message)), call)
 
     def construct_record(self, node, name, flow):
         signature = self.records[self.record_names[name]]
@@ -802,7 +852,8 @@ class Checker:
         value = self.bind_arguments(node, name, signature, flow)
         _, plan, _ = value.node.fields
         fields = tuple(parameter.name for parameter in signature.parameters)
-        return Checked(signature.output, Node(node.token, "record", (signature.output.name, fields, plan)))
+        return Checked(signature.output, Node(node.token, "record", (signature.output.name, fields, plan)),
+                       value.call)
 
     def prepend(self, node, flow, expected):
         candidates = []
@@ -908,7 +959,11 @@ class Checker:
             raise LanguageError(node.token, f"ambiguous call to '{name}'; name arguments for {labels}")
         resolved, plan = solutions[0]
         flow.nonzero = resolved.nonzero
-        return Checked(signature.output, Node(node.token, "invoke", (signature.key, plan, group)))
+        call = None
+        if self.facts is not None:
+            call = (signature.key, tuple((parameters[index].name, mutable, value if mutable else None)
+                                         for index, mutable, value in plan))
+        return Checked(signature.output, Node(node.token, "invoke", (signature.key, plan, group)), call)
 
     def check_argument(self, argument, parameter, flow):
         if argument.mutable != parameter.mutable:

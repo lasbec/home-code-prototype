@@ -103,6 +103,18 @@ Mark public functions, records, and enums with `export`. Place function examples
 
 `check`, `run`, and `test` check all reachable files. `run` invokes `main` from the selected file. `test` executes examples attached to functions in that file, and `test -r` includes examples from every reachable file once.
 
+## Save and export a program
+
+```sh
+python3 -B -m prototype save examples/runner/main.proto runner.sqlite
+python3 -B -m prototype export runner.sqlite runner-export
+python3 -B -m prototype test -r runner-export/main.proto
+```
+
+`save` checks the entry file and all transitive imports, then writes one SQLite snapshot. `export` regenerates the module tree from the database, checks the generated program, and prints the path to its entry file. Generated source uses consistent formatting and keeps comments and function examples. The database file and export directory must be new paths with existing parent directories.
+
+Inspect the snapshot with any SQLite client. `modules` identifies the entry file, `imports` records the graph, and `declarations` stores parsed declarations and bodies as JSON alongside effective guarantees. `semantic_facts` holds inferred types and declaration references. `calls` and `call_arguments` identify callees and record bound parameters in evaluation order. Token ordinals link these facts to source locations, and `comments` records placement between tokens. The schema version is stored in `PRAGMA user_version`. Treat the database as a snapshot for querying and export.
+
 ## Nano syntax highlighting
 
 Add this line to your Nano configuration (`~/.nanorc` or `~/.config/nano/nanorc`), using the absolute path to your checkout.
