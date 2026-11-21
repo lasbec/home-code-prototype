@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from operator import eq, ge, gt, le, lt, ne, truediv
 import os
 from pathlib import Path
+import secrets
 from select import select
 from time import monotonic
 
@@ -67,6 +68,41 @@ class Console:
 @dataclass(frozen=True)
 class Filesystem:
     pass
+
+
+class RandomSource:
+    def randbelow(self, width):
+        return secrets.randbelow(width)
+
+
+def with_ordered_bounds(draw):
+    def bounded_draw(source, bound0, bound1):
+        lower, upper = sorted((bound0, bound1))
+        return draw(source, lower, upper)
+
+    return bounded_draw
+
+
+@with_ordered_bounds
+def random_int(source, lower, upper):
+    try:
+        return Result("Ok", lower + source.randbelow(upper - lower + 1))
+    except OSError as error:
+        return Result("Err", Failure("RandomError", str(error)))
+
+
+@with_ordered_bounds
+def pseudo_random(state, lower, upper):
+    # PCG RXS M XS with 32-bit state and output. Scale one output to the
+    # interval by taking the high 32 bits, dividing the samples as evenly as possible.
+    mask = (1 << 32) - 1
+    next_state = (state * 747796405 + 2891336453) & mask
+    shift = (next_state >> 28) + 4
+    word = ((next_state ^ (next_state >> shift)) * 277803737) & mask
+    sample = word ^ (word >> 22)
+    value = lower + ((sample * (upper - lower + 1)) >> 32)
+    signed_state = next_state - (1 << 32) if next_state >= (1 << 31) else next_state
+    return Record("RandomDraw", (("value", value), ("state", signed_state)))
 
 
 def output_text(console, text, error_code):
@@ -214,8 +250,12 @@ BUILTINS = {
     "readKeysFor": read_keys_for,
     "readFileUTF8": read_file,
     "writeFileUTF8": write_file,
+    "random": random_int,
+    "pseudoRandom": pseudo_random,
     "add": lambda left, right: checked_int(left + right),
     "subtract": lambda left, right: checked_int(left - right),
+    "min": min,
+    "max": max,
     "nonzero": nonzero,
     "at": list_at,
     "prepend": lambda item, items: (item, *items),
@@ -227,7 +267,8 @@ BUILTINS = {
     "hostErrorKind": host_error_kind,
     "describeHostError": lambda error: display(error),
 }
-OPERATORS = {"==": eq, "!=": ne, "<": lt, ">": gt, "<=": le, ">=": ge, "/": truediv}
+OPERATORS = {"==": eq, "!=": ne, "<": lt, ">": gt, "<=": le, ">=": ge, "/": truediv,
+             "*": lambda left, right: checked_int(left * right)}
 
 
 class Interpreter:
@@ -285,7 +326,7 @@ class Interpreter:
                     return True, value
         if kind == "for":
             name, source, body = fields
-            for item in environment[source].value:
+            for item in self.expression(source, environment):
                 returns, value = self.block(body, {**environment, name: Cell(item)})
                 if returns:
                     return True, value
@@ -315,11 +356,11 @@ class Interpreter:
             value, index = fields
             return self.expression(value, environment).fields[index][1]
         if kind == "binary":
-            left, right = fields
+            left, right, _ = fields
             return OPERATORS[node.token.text](self.expression(left, environment),
                                               self.expression(right, environment))
         if kind == "invoke":
-            name, plan = fields
+            name, plan, _ = fields
             return self.call(name, self.arguments(plan, environment))
         raise AssertionError(kind)
 
@@ -349,4 +390,6 @@ def display(value):
         return "[" + ", ".join(map(display, value)) + "]"
     if isinstance(value, (Console, Filesystem)):
         return type(value).__name__.lower()
+    if isinstance(value, RandomSource):
+        return "random"
     return str(value)

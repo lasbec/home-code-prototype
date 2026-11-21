@@ -7,7 +7,7 @@ import signal
 import sys
 
 from .checker import Checker
-from .runtime import Console, Filesystem, Interpreter, display
+from .runtime import Console, Filesystem, Interpreter, RandomSource, display
 from .syntax import LanguageError, Parser
 
 
@@ -24,6 +24,7 @@ def main():
     run.add_argument("source", type=Path)
     run.add_argument("--console", action="store_true", help="pass live standard input and output")
     run.add_argument("--filesystem", action="store_true", help="pass access to the live filesystem")
+    run.add_argument("--random", action="store_true", help="pass access to secure host randomness")
     args = cli.parse_args()
     try:
         source = args.source.read_text(encoding="utf-8")
@@ -47,6 +48,8 @@ def main():
         capabilities["console"] = Console(sys.stdin, sys.stdout)
     if args.filesystem:
         capabilities["filesystem"] = Filesystem()
+    if args.random:
+        capabilities["random"] = RandomSource()
     arguments = []
     for parameter in entry.parameters:
         capability = parameter.type.name

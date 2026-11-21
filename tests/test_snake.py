@@ -11,12 +11,13 @@ import unittest
 from unittest.mock import patch
 
 from prototype.checker import Checker
-from prototype.runtime import Console, Filesystem, Interpreter, Record, Variant
+from prototype.runtime import Console, Filesystem, Interpreter, RandomSource, Record, Variant
 from prototype.syntax import LanguageError, Parser
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "examples" / "snake.proto"
+SEED_WITH_FOOD_AHEAD = 3608
 
 
 def compile_program(source):
@@ -34,7 +35,7 @@ def direction(tag):
 def game(head, body, facing, food, score=0):
     return Record("Game", (
         ("head", head), ("body", body), ("direction", direction(facing)),
-        ("food", Variant("Food", "Available", food)), ("score", score),
+        ("food", Variant("Food", "Available", food)), ("score", score), ("randomState", 0),
     ))
 
 
@@ -50,18 +51,40 @@ class SnakeRules(unittest.TestCase):
         return dict(result.value.value.fields) if result.value.value is not None else None
 
     def test_movement_reversal_and_food(self):
-        initial = self.interpreter.call("initialGame", ())
+        initial = self.interpreter.call("initialGame", (SEED_WITH_FOOD_AHEAD,))
         self.step(initial, "Left", "Reversed")
         moved = self.step(initial, "Up", "Moved")
         self.assertEqual(moved["head"], position(3, 2))
         self.assertEqual(moved["body"], (position(3, 3), position(2, 3)))
         self.assertEqual(moved["score"], 0)
+        self.assertEqual(moved["randomState"], dict(initial.fields)["randomState"])
 
         grown = self.step(initial, "Right", "Moved")
         self.assertEqual(grown["head"], position(4, 3))
         self.assertEqual(len(grown["body"]), 3)
         self.assertEqual(grown["score"], 1)
-        self.assertEqual(grown["food"].value, position(0, 0))
+        self.assertNotIn(grown["food"].value, (grown["head"], *grown["body"]))
+        self.assertNotEqual(grown["randomState"], moved["randomState"])
+
+    def test_first_apple_varies_by_seed_and_replays(self):
+        first = self.interpreter.call("initialGame", (0,))
+        second = self.interpreter.call("initialGame", (1,))
+        self.assertEqual(first, self.interpreter.call("initialGame", (0,)))
+        self.assertNotEqual(dict(first.fields)["food"], dict(second.fields)["food"])
+
+    def test_launch_draws_one_seed_and_reports_a_failure(self):
+        terminal = Console(StringIO("q\n"), StringIO())
+        with patch("prototype.runtime.secrets.randbelow", return_value=2**31) as draw:
+            result = self.interpreter.call("main", (terminal, Filesystem(), RandomSource()))
+        self.assertEqual(result.tag, "Ok")
+        draw.assert_called_once_with(2**32)
+        self.assertIn("Round abandoned.", terminal.stdout.getvalue())
+
+        terminal = Console(StringIO(), StringIO())
+        with patch("prototype.runtime.secrets.randbelow", side_effect=OSError("entropy unavailable")):
+            result = self.interpreter.call("main", (terminal, Filesystem(), RandomSource()))
+        self.assertEqual(result.tag, "Ok")
+        self.assertEqual(terminal.stdout.getvalue(), "Could not seed Snake: RandomError: entropy unavailable\n")
 
     def test_wall_and_body_collisions_and_departing_tail(self):
         edge = game(position(47, 4), (position(46, 4), position(45, 4)),
@@ -90,7 +113,7 @@ class SnakeRules(unittest.TestCase):
         self.assertEqual(len(finished["body"]), len(path) - 1)
 
     def test_board_renders_48_columns_and_32_rows(self):
-        initial = self.interpreter.call("initialGame", ())
+        initial = self.interpreter.call("initialGame", (0,))
         *rows, score = self.interpreter.call("render", (initial,)).splitlines()
         self.assertEqual([len(row) for row in rows], [48] * 32)
         self.assertEqual(score, "Score: 0")
@@ -113,7 +136,7 @@ class SnakeRules(unittest.TestCase):
             target.write_text("7\n", encoding="utf-8")
             terminal = Console(StringIO("d\n" + "w\n" * 4), StringIO())
             with patch("prototype.runtime.Path.write_bytes", side_effect=PermissionError("read only")):
-                result = self.interpreter.call("play", (terminal, Filesystem(), str(target)))
+                result = self.interpreter.call("play", (terminal, Filesystem(), str(target), SEED_WITH_FOOD_AHEAD))
             output = terminal.stdout.getvalue()
             self.assertEqual(result.tag, "Ok")
             self.assertIn("Final score: 1", output)
@@ -128,24 +151,36 @@ class SnakePersistence(unittest.TestCase):
         self.directory = workspace.name
         self.scores = Path(self.directory, "snake-scores.txt")
 
-    def play(self, commands):
+    def run_game(self, commands, *flags):
         command = [sys.executable, "-B", "-m", "prototype", "run", str(SOURCE),
-                   "--console", "--filesystem"]
-        result = subprocess.run(command, input=commands, text=True, capture_output=True,
-                                cwd=self.directory, env=dict(os.environ, PYTHONPATH=str(ROOT)),
-                                timeout=10, check=True)
+                   "--console", "--filesystem", *flags]
+        return subprocess.run(command, input=commands, text=True, capture_output=True,
+                              cwd=self.directory, env=dict(os.environ, PYTHONPATH=str(ROOT)), timeout=10)
+
+    def play(self, commands):
+        result = self.run_game(commands, "--random")
+        result.check_returncode()
         self.assertEqual(result.stderr, "")
         return result.stdout
+
+    def final_score(self, output):
+        match = re.search(r"You hit a wall\. Final score: (\d+)", output)
+        self.assertIsNotNone(match, output)
+        return match[1]
+
+    def test_random_capability_requires_flag(self):
+        result = self.run_game("")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("main requires --random", result.stderr)
 
     def test_completed_rounds_persist_between_runs(self):
         first = self.play("d\n" + "w\n" * 4)
         self.assertIn("Best score: 0", first)
-        self.assertIn("You hit a wall. Final score: 1", first)
+        first_score = self.final_score(first)
         self.assertIn("Score saved.", first)
         second = self.play("w\n" * 4)
-        self.assertIn("Best score: 1", second)
-        self.assertIn("You hit a wall. Final score: 0", second)
-        self.assertEqual(self.scores.read_bytes(), b"1\n0\n")
+        self.assertIn(f"Best score: {first_score}", second)
+        self.assertEqual(self.scores.read_text(), f"{first_score}\n{self.final_score(second)}\n")
 
     def test_reversal_invalid_command_quit_and_eof(self):
         result = self.play("?\na\nq\n")
@@ -170,7 +205,7 @@ class SnakePersistence(unittest.TestCase):
         self.scores.write_bytes(b"12\r\n9")
         result = self.play("w\n" * 4)
         self.assertIn("Best score: 12", result)
-        self.assertEqual(self.scores.read_bytes(), b"12\n9\n0\n")
+        self.assertEqual(self.scores.read_text(), f"12\n9\n{self.final_score(result)}\n")
 
 
 class LanguageRules(unittest.TestCase):

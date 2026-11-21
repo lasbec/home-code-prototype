@@ -52,6 +52,8 @@ STRING = Type("string")
 UNIT = Type("unit")
 CONSOLE = Type("console")
 FILESYSTEM = Type("filesystem")
+RANDOM = Type("random")
+RANDOM_DRAW = Type("RandomDraw")
 OVERFLOW = Type("Overflow")
 ZERO = Type("Zero")
 INDEX_ERROR = Type("IndexError")
@@ -61,8 +63,8 @@ PARSE_INT_ERROR = Type("ParseIntError")
 GUARANTEES = frozenset({"terminates", "deterministic", "pure"})
 MODIFIERS = GUARANTEES | {"commutative"}
 SIMPLE_TYPES = {
-    item.name for item in (BOOL, STRING, UNIT, CONSOLE, FILESYSTEM, OVERFLOW, ZERO,
-                           INDEX_ERROR, HOST_ERROR, HOST_ERROR_KIND, PARSE_INT_ERROR)
+    item.name for item in (BOOL, STRING, UNIT, CONSOLE, FILESYSTEM, RANDOM, RANDOM_DRAW,
+                           OVERFLOW, ZERO, INDEX_ERROR, HOST_ERROR, HOST_ERROR_KIND, PARSE_INT_ERROR)
 }
 
 
@@ -75,6 +77,10 @@ def quotient_units(numerator, denominator):
     for unit, power in denominator:
         powers[unit] = powers.get(unit, 0) - power
     return tuple(sorted((unit, power) for unit, power in powers.items() if power))
+
+
+def product_units(left, right):
+    return quotient_units(left, tuple((unit, -power) for unit, power in right))
 
 
 @dataclass(frozen=True)
@@ -102,10 +108,18 @@ class Function:
     parameters: tuple
     output: Type
     body: tuple = ()
+    commutative: tuple = ()
 
     @property
     def name(self):
         return self.token.text
+
+    @property
+    def commutative_slots(self):
+        if "commutative" not in self.modifiers:
+            return frozenset()
+        return frozenset(index for index, parameter in enumerate(self.parameters)
+                         if not self.commutative or parameter.name in self.commutative)
 
 
 @dataclass(frozen=True)
@@ -138,7 +152,7 @@ RESERVED = MODIFIERS | {
     "match", "true", "false", "unit", "record", "enum", "loop",
 }
 PRECEDENCE = {"as": 0, "==": 1, "!=": 1, "<": 1, ">": 1, "<=": 1,
-              ">=": 1, "+": 2, "-": 2, "/": 3}
+              ">=": 1, "+": 2, "-": 2, "*": 3, "/": 3}
 
 
 def tokenize(source):
@@ -214,18 +228,23 @@ class Parser:
                 declarations.append(EnumDeclaration(name, self.separated("}", self.variant)))
                 continue
             modifiers = set()
+            commutative = []
             while self.current.text in MODIFIERS:
                 token = self.take()
                 if token.text in modifiers:
                     raise LanguageError(token, f"duplicate modifier '{token.text}'")
                 modifiers.add(token.text)
+                if token.text == "commutative":
+                    while self.current.kind == "name" and self.current.text not in RESERVED:
+                        commutative.append(self.name().text)
             self.expect("fn")
             name = self.name()
             self.expect("(")
             parameters = self.separated(")", self.parameter)
             self.expect("->")
             output = self.type()
-            declarations.append(Function(name, frozenset(modifiers), parameters, output, self.block()))
+            declarations.append(Function(name, frozenset(modifiers), parameters, output,
+                                         self.block(), tuple(commutative)))
         return tuple(declarations)
 
     def separated(self, end, read):

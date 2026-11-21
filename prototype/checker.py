@@ -4,17 +4,19 @@ from dataclasses import dataclass, field
 
 from .syntax import (
     BOOL, CONSOLE, FILESYSTEM, GUARANTEES, HOST_ERROR, HOST_ERROR_KIND, INDEX_ERROR,
-    INT, OVERFLOW, PARSE_INT_ERROR, SIMPLE_TYPES, STRING, UNIT, ZERO, Argument,
+    INT, OVERFLOW, PARSE_INT_ERROR, RANDOM, RANDOM_DRAW, SIMPLE_TYPES, STRING, UNIT, ZERO, Argument,
     EnumDeclaration, Function, LanguageError, Node, Parameter, RecordDeclaration,
-    Token, Type, quotient_units, result_type,
+    Token, Type, product_units, quotient_units, result_type,
 )
 
 
-def builtin(name, parameters, output, modifiers=frozenset()):
+def builtin(name, parameters, output, modifiers=frozenset(), commutative=()):
+    if commutative:
+        modifiers = modifiers | {"commutative"}
     return Function(Token(name, 0, 0), modifiers, tuple(
         Parameter(Token(label, 0, 0), parameter_type)
         for label, parameter_type in parameters
-    ), output)
+    ), output, commutative=commutative)
 
 
 HOST_FUNCTIONS = {
@@ -29,6 +31,8 @@ HOST_FUNCTIONS = {
                 result_type(STRING, HOST_ERROR)),
         builtin("writeFileUTF8", (("filesystem", FILESYSTEM), ("path", STRING), ("text", STRING)),
                 result_type(UNIT, HOST_ERROR)),
+        builtin("random", (("source", RANDOM), ("bound0", INT), ("bound1", INT)),
+                result_type(INT, HOST_ERROR), commutative=("bound0", "bound1")),
     )
 }
 PURE_FUNCTIONS = {
@@ -39,9 +43,11 @@ PURE_FUNCTIONS = {
         builtin("formatInt32", (("value", INT),), STRING, GUARANTEES),
         builtin("hostErrorKind", (("error", HOST_ERROR),), HOST_ERROR_KIND, GUARANTEES),
         builtin("describeHostError", (("error", HOST_ERROR),), STRING, GUARANTEES),
+        builtin("pseudoRandom", (("state", INT), ("bound0", INT), ("bound1", INT)),
+                RANDOM_DRAW, GUARANTEES, ("bound0", "bound1")),
     )
 }
-GENERIC_FUNCTIONS = {"add", "subtract", "nonzero", "at", "prepend", "dropLast"}
+GENERIC_FUNCTIONS = {"add", "subtract", "min", "max", "nonzero", "at", "prepend", "dropLast"}
 CONSTRUCTORS = {"Ok", "Err"}
 BUILTIN_NAMES = HOST_FUNCTIONS.keys() | PURE_FUNCTIONS.keys() | GENERIC_FUNCTIONS | CONSTRUCTORS
 
@@ -129,10 +135,11 @@ def merge_proofs(flow, branches):
 class Checker:
     def __init__(self, declarations):
         self.functions = {}
-        self.records = {}
+        self.records = {RANDOM_DRAW.name: builtin(RANDOM_DRAW.name, (("value", INT), ("state", INT)),
+                                                  RANDOM_DRAW, GUARANTEES)}
         self.enums = {HOST_ERROR_KIND.name: {"EndOfInput": None, "FileNotFound": None, "Other": None}}
         self.current_function = None
-        used_names = set(BUILTIN_NAMES)
+        used_names = set(BUILTIN_NAMES) | self.records.keys()
         builtin_types = SIMPLE_TYPES | {"int32", "f64", "result", "list"}
         for declaration in declarations:
             token = declaration.token
@@ -161,18 +168,22 @@ class Checker:
         if "pure" in function.modifiers and any(p.mutable for p in function.parameters):
             raise LanguageError(function.token, "a pure function cannot accept a mut parameter")
         if "commutative" in function.modifiers:
-            types = [parameter.type for parameter in function.parameters]
-            if (not {"pure", "deterministic"} <= function.modifiers or len(types) != 2
-                    or types[0] != types[1]):
-                raise LanguageError(function.token,
-                                    "commutative requires pure, deterministic and two equally typed parameters")
+            slots = function.commutative_slots
+            group = [parameter for index, parameter in enumerate(function.parameters) if index in slots]
+            if function.commutative:
+                if len(slots) < 2 or len(slots) != len(function.commutative):
+                    raise LanguageError(function.token, "commutative must name two or more distinct parameters")
+            elif len(slots) != 2:
+                raise LanguageError(function.token, "commutative must name its parameters on functions with arity other than two")
+            if any(parameter.mutable for parameter in group) or len({parameter.type for parameter in group}) != 1:
+                raise LanguageError(function.token, "commutative parameters must be read-only and have the same type")
         if function.name == "main":
             capabilities = [parameter.type for parameter in function.parameters]
             if (any(parameter.mutable for parameter in function.parameters)
-                    or not set(capabilities) <= {CONSOLE, FILESYSTEM}
+                    or not set(capabilities) <= {CONSOLE, FILESYSTEM, RANDOM}
                     or len(capabilities) != len(set(capabilities))):
                 raise LanguageError(function.token,
-                                    "main may accept one console and one filesystem, both read-only")
+                                    "main may accept one of each read-only capability: console, filesystem, random")
 
     def program(self):
         checked = {}
@@ -184,11 +195,40 @@ class Checker:
             body, returns = self.block(function.body, flow)
             if not returns and function.output != UNIT:
                 raise LanguageError(function.token, f"some paths do not return {function.output}")
-            checked[function.name] = Function(
-                function.token, function.modifiers, function.parameters, function.output, body
-            )
+            self.check_commutativity(function, body)
+            checked[function.name] = Function(function.token, function.modifiers, function.parameters,
+                                              function.output, body, function.commutative)
         self.check_termination(checked)
         return checked
+
+    def check_commutativity(self, function, body):
+        slots = function.commutative_slots
+        if not slots:
+            return
+        names = tuple(parameter.name for index, parameter in enumerate(function.parameters) if index in slots)
+        group = set(names)
+        allowed = set()
+        # Lowered calls carry their actual destination slots. Walk visits each call
+        # before its operands, so only direct uses in a complete group are allowed.
+        for node in walk(body):
+            if node.kind == "invoke":
+                _, plan, destinations = node.fields
+            elif node.kind == "binary" and node.fields[2]:
+                left, right, _ = node.fields
+                plan = ((0, False, left), (1, False, right))
+                destinations = {0, 1}
+            else:
+                if node.kind == "variable" and node.fields[0] in group and id(node) not in allowed:
+                    raise LanguageError(node.token,
+                                        f"commutative parameters ({', '.join(names)}) must be passed together "
+                                        "exactly once to a commutative parameter group")
+                continue
+            members = [(slot, value) for slot, mutable, value in plan
+                       if not mutable and value.kind == "variable" and value.fields[0] in group]
+            if (len(members) == len(names)
+                    and {value.fields[0] for _, value in members} == group
+                    and all(slot in destinations for slot, _ in members)):
+                allowed.update(id(value) for _, value in members)
 
     def check_termination(self, checked):
         active = set()
@@ -201,7 +241,7 @@ class Checker:
             for node in walk(function.body):
                 if not isinstance(node, Node) or node.kind != "invoke":
                     continue
-                name, _ = node.fields
+                name, _, _ = node.fields
                 if name in active:
                     raise LanguageError(node.token,
                                         f"recursive call to '{name}' cannot guarantee termination")
@@ -266,7 +306,7 @@ class Checker:
             loop.define(item, binding.type.arguments[0])
             lowered_body = self.loop_body(body, loop)
             flow.nonzero = loop.nonzero
-            lowered = (item.text, source.text, lowered_body)
+            lowered = (item.text, Node(source, "variable", (source.text,)), lowered_body)
         elif kind == "loop":
             if "terminates" in self.current_function.modifiers:
                 raise LanguageError(node.token, "an unbounded loop cannot guarantee termination")
@@ -395,6 +435,8 @@ class Checker:
             if operator == "+":
                 arguments = tuple(Argument(operand.token, operand) for operand in fields)
                 return self.call(Node(node.token, "call", arguments), flow, expected, name="add")
+            if operator == "*":
+                return self.multiplication(node, flow)
             return self.comparison(node, flow)
         raise AssertionError(kind)
 
@@ -434,7 +476,18 @@ class Checker:
                 raise LanguageError(node.token, f"comparison is unavailable for {base}")
         left = self.expression(left_node, flow, base)
         right = self.expression(right_node, flow, base)
-        return Checked(BOOL, Node(node.token, "binary", (left.node, right.node)))
+        commutative = equality and base.name == "int32"
+        return Checked(BOOL, Node(node.token, "binary", (left.node, right.node, commutative)))
+
+    def multiplication(self, node, flow):
+        operands = [self.expression(operand, flow) for operand in node.fields]
+        for operand in operands:
+            if operand.type.name != "int32":
+                raise LanguageError(operand.node.token, f"multiplication expects int32, found {operand.type}")
+        left, right = operands
+        number = Type("int32", units=product_units(left.type.units, right.type.units))
+        return Checked(result_type(number, OVERFLOW),
+                       Node(node.token, "binary", (left.node, right.node, True)))
 
     def division(self, node, flow, annotation):
         if annotation.name != "f64":
@@ -461,7 +514,7 @@ class Checker:
         derived = Type("f64", units=quotient_units(left.type.units, right.type.units))
         if derived != annotation:
             raise LanguageError(node.token, f"division produces {derived}, found annotation {annotation}")
-        return Checked(annotation, Node(node.token, "binary", (left.node, right.node)))
+        return Checked(annotation, Node(node.token, "binary", (left.node, right.node, False)))
 
     def generic_signature(self, name, arguments, flow, expected):
         if name in {"at", "dropLast"}:
@@ -479,15 +532,18 @@ class Checker:
             return builtin(name, (("items", items), ("index", INT)),
                            result_type(items.arguments[0], INDEX_ERROR), GUARANTEES)
         hint = self.type_hint((arg.expression for arg in arguments), flow, "int32")
+        if hint is None and name in {"min", "max"} and expected and expected.name == "int32":
+            hint = expected
         if hint is None and expected and expected.name == "result":
             if expected.arguments[0].name == "int32":
                 hint = expected.arguments[0]
         number = (hint or INT).without_refinement()
         if name == "nonzero":
             return builtin(name, (("value", number),), result_type(number.refined(), ZERO), GUARANTEES)
-        modifiers = GUARANTEES | {"commutative"} if name == "add" else GUARANTEES
+        direct = name in {"min", "max"}
+        group = () if name == "subtract" else ("left", "right")
         return builtin(name, (("left", number), ("right", number)),
-                       result_type(number, OVERFLOW), modifiers)
+                       number if direct else result_type(number, OVERFLOW), GUARANTEES, group)
 
     def call(self, node, flow, expected, name=None):
         name = name or node.token.text
@@ -519,7 +575,7 @@ class Checker:
         if any(argument.label is None for argument in node.fields):
             raise LanguageError(node.token, f"'{name}' requires named fields")
         value = self.bind_arguments(node, name, signature, flow)
-        _, plan = value.node.fields
+        _, plan, _ = value.node.fields
         fields = tuple(parameter.name for parameter in signature.parameters)
         return Checked(signature.output, Node(node.token, "record", (name, fields, plan)))
 
@@ -576,11 +632,11 @@ class Checker:
         solutions = []
         error = None
         error_depth = -1
-        limit = 1 if "commutative" in signature.modifiers else 2
+        group = signature.commutative_slots
 
         def search(position, available, trial, plan, mutable_arguments):
             nonlocal error, error_depth
-            if len(solutions) >= limit:
+            if len(solutions) == 2:
                 return
             if position == len(arguments):
                 try:
@@ -592,7 +648,12 @@ class Checker:
                 return
             argument = arguments[position]
             candidates = available if argument.label is None else (slots[argument.label],)
+            # Open slots in the group have identical contracts. Try one representative
+            # for each unnamed argument while still exploring slots outside the group.
+            first = next((index for index in candidates if index in group), None)
             for index in candidates:
+                if index in group and index != first:
+                    continue
                 parameter = parameters[index]
                 candidate = trial.copy()
                 try:
@@ -605,7 +666,7 @@ class Checker:
                        candidate, plan + ((index, argument.mutable, value),),
                        mutable_arguments + ((argument, parameter, value),) if argument.mutable
                        else mutable_arguments)
-                if len(solutions) >= limit:
+                if len(solutions) == 2:
                     return
 
         search(0, open_slots, flow, (), ())
@@ -622,7 +683,7 @@ class Checker:
             raise LanguageError(node.token, f"ambiguous call to '{name}'; name arguments for {labels}")
         resolved, plan = solutions[0]
         flow.nonzero = resolved.nonzero
-        return Checked(signature.output, Node(node.token, "invoke", (name, plan)))
+        return Checked(signature.output, Node(node.token, "invoke", (name, plan, group)))
 
     def check_argument(self, argument, parameter, flow):
         if argument.mutable != parameter.mutable:

@@ -1,7 +1,8 @@
-// Game rules and rendering use only data. The console and filesystem enter at main.
+// Game rules and rendering use only data. The host supplies the seed at main.
 record Position { x: int32, y: int32 }
 enum Direction { Up, Down, Left, Right }
 enum Food { Available(Position), Full }
+record FoodSpawn { food: Food, randomState: int32 }
 
 record Game {
     head: Position,
@@ -9,6 +10,7 @@ record Game {
     direction: Direction,
     food: Food,
     score: int32,
+    randomState: int32,
 }
 
 enum Turn { Moved(Game), Reversed, HitWall, HitBody, Won(Game) }
@@ -35,13 +37,17 @@ pure deterministic terminates fn rows() -> list<int32> {
     ];
 }
 
-pure deterministic terminates fn initialGame() -> Game {
+pure deterministic terminates fn initialGame(seed: int32) -> Game {
+    let head = Position(x: 3, y: 3);
+    let body = [Position(x: 2, y: 3), Position(x: 1, y: 3)];
+    let spawn = nextFood(prepend(head, body), seed);
     return Game(
-        head: Position(x: 3, y: 3),
-        body: [Position(x: 2, y: 3), Position(x: 1, y: 3)],
+        head: head,
+        body: body,
         direction: Direction::Right,
-        food: Food::Available(Position(x: 4, y: 3)),
+        food: spawn.food,
         score: 0,
+        randomState: spawn.randomState,
     );
 }
 
@@ -107,24 +113,40 @@ pure deterministic terminates fn foodAt(food: Food, position: Position) -> bool 
     }
 }
 
-pure deterministic terminates fn nextFood(occupied: list<Position>) -> Food {
+pure deterministic terminates fn nextFood(occupied: list<Position>, state: int32) -> FoodSpawn {
     let xs = columns();
     let ys = rows();
+    let mut free: list<Position> = [];
+    let mut last = -1;
     for y in ys {
         for x in xs {
             let cell = Position(x: x, y: y);
-            if contains(occupied, cell) == false { return Food::Available(cell); }
+            if contains(occupied, cell) == false {
+                // The board bounds keep this index well within int32.
+                match last + 1 {
+                    Ok(index) { last = index; free = prepend(cell, free); }
+                    Err(error) {}
+                }
+            }
         }
     }
-    return Food::Full;
+    if last >= 0 {
+        let draw = pseudoRandom(state: state, 0, last);
+        match at(free, draw.value) {
+            Ok(cell) { return FoodSpawn(food: Food::Available(cell), randomState: draw.state); }
+            Err(error) {} // The draw is between zero and the last free index.
+        }
+    }
+    return FoodSpawn(food: Food::Full, randomState: state);
 }
 
 pure deterministic terminates fn grow(game: Game, head: Position, body: list<Position>, direction: Direction) -> result<Turn, Overflow> {
     match game.score + 1 {
         Ok(score) {
-            let food = nextFood(prepend(head, body));
-            let next = Game(head: head, body: body, direction: direction, food: food, score: score);
-            match food {
+            let spawn = nextFood(prepend(head, body), game.randomState);
+            let next = Game(head: head, body: body, direction: direction, food: spawn.food, score: score,
+                            randomState: spawn.randomState);
+            match spawn.food {
                 Available(position) { return Ok(Turn::Moved(next)); }
                 Full { return Ok(Turn::Won(next)); }
             }
@@ -151,6 +173,7 @@ pure deterministic terminates fn advance(game: Game, direction: Direction) -> re
             if contains(shortened, head) { return Ok(Turn::HitBody); }
             return Ok(Turn::Moved(Game(
                 head: head, body: shortened, direction: direction, food: game.food, score: game.score,
+                randomState: game.randomState,
             )));
         }
         Err(error) { return Err(error); }
@@ -306,7 +329,7 @@ pure deterministic terminates fn victoryText(game: Game, heading: string, intera
     return concat(left: render(game), right: "\nYou filled the board!");
 }
 
-fn playRound(terminal: console, files: filesystem, path: string, interactive: bool) -> result<unit, HostError> {
+fn playRound(terminal: console, files: filesystem, path: string, interactive: bool, seed: int32) -> result<unit, HostError> {
     let scores = loadScores(files, path);
     let mut instructions = "\nSnake | w/a/s/d + Enter to move | q to quit";
     if interactive {
@@ -325,7 +348,7 @@ fn playRound(terminal: console, files: filesystem, path: string, interactive: bo
         }
     }
 
-    let mut game = initialGame();
+    let mut game = initialGame(seed);
     let mut redraw = true;
     loop {
         if redraw {
@@ -380,13 +403,18 @@ fn playRound(terminal: console, files: filesystem, path: string, interactive: bo
     }
 }
 
-fn play(terminal: console, files: filesystem, path: string) -> result<unit, HostError> {
+fn play(terminal: console, files: filesystem, path: string, seed: int32) -> result<unit, HostError> {
     match enableKeyInput(terminal) {
-        Ok(interactive) { return playRound(terminal, files, path, interactive); }
+        Ok(interactive) { return playRound(terminal, files, path, interactive, seed); }
         Err(error) { return Err(error); }
     }
 }
 
-fn main(terminal: console, files: filesystem) -> result<unit, HostError> {
-    return play(terminal, files, "snake-scores.txt");
+fn main(terminal: console, files: filesystem, source: random) -> result<unit, HostError> {
+    match random(source, -2147483648, 2147483647) {
+        Ok(seed) { return play(terminal, files, "snake-scores.txt", seed); }
+        Err(error) {
+            return print(terminal, concat(left: "Could not seed Snake: ", right: describeHostError(error)));
+        }
+    }
 }
