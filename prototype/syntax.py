@@ -6,6 +6,8 @@ import math
 from pathlib import Path
 import re
 
+from .channels.api import ERROR_TYPES as CHANNEL_ERRORS, HANDLES as CHANNEL_HANDLES
+
 
 @dataclass(frozen=True)
 class Token:
@@ -76,8 +78,12 @@ THREADS = Type("threads")
 CHANNELS = Type("channels")
 MOCK_CAPABILITIES = {capability.name: capability for capability in (CONSOLE, FILESYSTEM, RANDOM)}
 CAPABILITIES = {**MOCK_CAPABILITIES, THREADS.name: THREADS, CHANNELS.name: CHANNELS}
-SHARED_HANDLES = {"Thread", "Channel"}
-GENERIC_TYPES = {"list": 1, "result": 2, "Thread": 1, "Channel": 1, "TrySendError": 1, "SendTimeout": 1}
+SHARED_HANDLES = {"Thread"} | CHANNEL_HANDLES
+GENERIC_TYPES = {
+    "list": 1, "result": 2, "Thread": 1,
+    **dict.fromkeys(CHANNEL_HANDLES, 1),
+    **{name: 1 for name, operation in CHANNEL_ERRORS.items() if operation.carries_message},
+}
 KILLED = Type("Killed")
 RANDOM_DRAW = Type("RandomDraw")
 OVERFLOW = Type("Overflow")
@@ -92,7 +98,9 @@ EXAMPLE_ERROR_MESSAGES = {
 GUARANTEES = frozenset({"ending", "deterministic", "pure"})
 MODIFIERS = GUARANTEES | {"commutative"}
 SIMPLE_TYPES = (
-    CAPABILITIES.keys() | {"Capacity", "Empty", "Never", "Timeout"} | {
+    CAPABILITIES.keys() | {"Capacity"} | {
+        name for name, operation in CHANNEL_ERRORS.items() if not operation.carries_message
+    } | {
         item.name for item in (BOOL, STRING, UNIT, RANDOM_DRAW, KILLED,
                                OVERFLOW, ZERO, INDEX_ERROR, HOST_ERROR, HOST_ERROR_KIND, PARSE_INT_ERROR)
     }

@@ -61,6 +61,8 @@ let result = try_receive(queue);
 
 `send_timeout(channel, message, timeout)` and `receive_timeout(channel, timeout)` take a `uint32<ms>` duration. A zero duration makes one immediate attempt. If the deadline arrives first, the operation returns `Timeout` and leaves the wait queue. A send returns the original message in its `SendTimeout<T>::Timeout` error. Deadlines at the current clock time are processed before another transfer.
 
+Use `create_closable_channel` with a `ClosableChannel<T>` result type when producers need to signal completion. Use the `_closable` suffix on each send and receive operation, for example `receive_blocking_closable` returns `result<T, Closed>`. Any holder can use `close(channel)`, which is idempotent. Buffered messages remain available in FIFO order. Pending and future sends return `Closed(message)`. Receivers see `Closed` once the buffer is drained.
+
 ## Mock host environments
 
 A mock is a self-contained `.proto` file that starts with `mock console`, `mock filesystem`, or `mock random`. Export every function for that environment in the host function table and keep other declarations private. Each export replaces the host capability parameter with `state: mut T`, where `T` is the same type across all exports. The remaining parameters, result type, and commutative group match the host signature. The mock can use host-independent built-ins and construct `HostError(kind: HostErrorKind::Other, message: "details")`.

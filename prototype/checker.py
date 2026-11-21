@@ -49,7 +49,7 @@ PURE_FUNCTIONS = {
 }
 GENERIC_FUNCTIONS = {"add", "subtract", "min", "max", "nonzero", "at", "prepend", "dropLast", "toUint32"}
 CONSTRUCTORS = {"Ok", "Err"}
-BUILTIN_NAMES = HOST_FUNCTIONS.keys() | PURE_FUNCTIONS.keys() | GENERIC_FUNCTIONS | CONSTRUCTORS | threads.OPERATIONS | channels.OPERATIONS
+BUILTIN_NAMES = HOST_FUNCTIONS.keys() | PURE_FUNCTIONS.keys() | GENERIC_FUNCTIONS | CONSTRUCTORS | threads.OPERATIONS | channels.OPERATIONS.keys()
 LITERAL_VALUE_KINDS = {"value", "integer", "decimal", "list", "variant", "call"}
 
 

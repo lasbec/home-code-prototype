@@ -12,7 +12,7 @@ from tempfile import NamedTemporaryFile
 from time import monotonic
 
 from .channels import buffer as channels
-from .channels.signatures import OPERATIONS as CHANNEL_OPERATIONS
+from .channels.api import OPERATIONS as CHANNEL_OPERATIONS
 from .checker import HOST_FUNCTIONS
 from .syntax import EXAMPLE_ERROR_MESSAGES, INTEGER_BOUNDS
 from .threads.scheduler import Scheduler

@@ -2,6 +2,7 @@
 
 import unittest
 
+from prototype.channels.api import OPERATIONS
 from prototype.channels.buffer import Channel, Channels
 from prototype.checker import Checker
 from prototype.runtime import Interpreter, display
@@ -192,13 +193,13 @@ class ChannelsTest(unittest.TestCase):
                 q = Channel(1)
 
                 def exercise():
-                    yield from q.send(scheduler, 1, blocking=False)
-                    sender = scheduler.start(q.send(scheduler, 2, 10, blocking=False))
+                    yield from q.send(scheduler, OPERATIONS["try_send"], 1)
+                    sender = scheduler.start(q.send(scheduler, OPERATIONS["send_timeout"], 2, 10))
                     yield
                     clock.advance(elapsed)
-                    self.assertEqual((yield from q.receive(scheduler, blocking=True)), 1)
+                    self.assertEqual((yield from q.receive(scheduler, OPERATIONS["receive_blocking"])), 1)
                     finished = yield from scheduler.join(sender)
-                    return display(finished.value), display((yield from q.receive(scheduler, blocking=False)))
+                    return display(finished.value), display((yield from q.receive(scheduler, OPERATIONS["try_receive"])))
 
                 self.assertEqual(scheduler.run(exercise()), (outcome, next_value))
                 self.assertEqual(q.senders, {})
@@ -210,15 +211,112 @@ class ChannelsTest(unittest.TestCase):
         q = Channel(1)
 
         def exercise():
-            receiver = scheduler.start(q.receive(scheduler, 10, blocking=False))
+            receiver = scheduler.start(q.receive(scheduler, OPERATIONS["receive_timeout"], 10))
             yield
             clock.advance(0.010)
-            yield from q.send(scheduler, 5, blocking=True)
+            yield from q.send(scheduler, OPERATIONS["send_blocking"], 5)
             result = yield from scheduler.join(receiver)
-            return display(result.value), (yield from q.receive(scheduler, blocking=True))
+            return display(result.value), (yield from q.receive(scheduler, OPERATIONS["receive_blocking"]))
 
         self.assertEqual(scheduler.run(exercise()), ("Err(Timeout::Timeout)", 5))
         self.assertEqual(q.receivers, {})
+
+    def test_closable_channel_drains_fifo_and_code_distinguishes_empty(self):
+        self.assertEqual(self.run_main("""
+            fn main(channels: channels) -> list<int32> {
+                let q: ClosableChannel<int32> = create_closable_channel(channels, Capacity::Bounded(2));
+                match try_receive_closable(q) {
+                    Err(error) {
+                        match error {
+                            Empty { return drain(q); }
+                            Closed { return []; }
+                        }
+                    }
+                    Ok(value) { return []; }
+                }
+            }
+            fn drain(q: ClosableChannel<int32>) -> list<int32> {
+                try_send_closable(q, 1);
+                send_blocking_closable(q, 2);
+                close(q);
+                close(q);
+                match receive_blocking_closable(q) {
+                    Ok(first) {
+                        match receive_timeout_closable(q, 0) {
+                            Ok(second) {
+                                match try_receive_closable(q) {
+                                    Err(error) {
+                                        match error {
+                                            Empty { return []; }
+                                            Closed { return [first, second]; }
+                                        }
+                                    }
+                                    Ok(extra) { return []; }
+                                }
+                            }
+                            Err(error) { return []; }
+                        }
+                    }
+                    Err(error) { return []; }
+                }
+            }
+        """), "[1, 2]")
+
+    def test_close_wakes_pending_sender_and_receiver(self):
+        for kind, expected in (
+            ("send_blocking_closable", "Err(ClosedSend::Closed(2))"),
+            ("receive_blocking_closable", "Err(Closed::Closed)"),
+        ):
+            with self.subTest(kind=kind):
+                scheduler = Scheduler()
+                q = Channel(1, closable=True)
+                op = OPERATIONS[kind]
+
+                def exercise():
+                    if op.action == "send":
+                        yield from q.send(scheduler, OPERATIONS["try_send_closable"], 1)
+                        waiter = scheduler.start(q.send(scheduler, op, 2))
+                    else:
+                        waiter = scheduler.start(q.receive(scheduler, op))
+                    yield
+                    q.close(scheduler)
+                    return (yield from scheduler.join(waiter)).value
+
+                self.assertEqual(display(scheduler.run(exercise())), expected)
+                self.assertFalse(q.senders or q.receivers)
+
+    def test_closed_send_returns_payload_and_modes_are_distinct(self):
+        self.assertEqual(self.run_main("""
+            fn main(channels: channels) -> result<unit, TimedSendClosableError<int32>> {
+                let q: ClosableChannel<int32> = create_closable_channel(channels, Capacity::Unbounded);
+                close(q);
+                return send_timeout_closable(q, message: 5, timeout: 0);
+            }
+        """), "Err(TimedSendClosableError::Closed(5))")
+        with self.assertRaisesRegex(LanguageError, "requires a ClosableChannel"):
+            compile_program("fn invalid(q: Channel<int32>) -> unit { close(q); }")
+
+    def test_closure_and_timeout_resolve_once(self):
+        for elapsed, expected in (
+            (0.009, "Err(TimedSendClosableError::Closed(2))"),
+            (0.010, "Err(TimedSendClosableError::Timeout(2))"),
+        ):
+            with self.subTest(elapsed=elapsed):
+                clock = ControlledClock()
+                scheduler = Scheduler(clock=clock.now, idle=clock.advance)
+                q = Channel(1, closable=True)
+
+                def exercise():
+                    yield from q.send(scheduler, OPERATIONS["try_send_closable"], 1)
+                    pending = scheduler.start(q.send(scheduler, OPERATIONS["send_timeout_closable"], 2, 10))
+                    yield
+                    clock.advance(elapsed)
+                    q.close(scheduler)
+                    self.assertEqual(list(q.messages), [1])
+                    return (yield from scheduler.join(pending)).value
+
+                self.assertEqual(display(scheduler.run(exercise())), expected)
+                self.assertFalse(q.senders or scheduler.timers.events)
 
 
 class ControlledClock:

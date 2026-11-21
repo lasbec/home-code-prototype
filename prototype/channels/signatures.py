@@ -3,56 +3,57 @@
 from dataclasses import replace
 
 from ..syntax import CHANNELS, UINT, UNIT, LanguageError, Type, builtin, result_type
+from .api import ERROR_TYPES, HANDLES, OPERATIONS, handle_name
 
 
 CAPACITY = Type("Capacity")
-EMPTY = Type("Empty")
-NEVER = Type("Never")
-TIMEOUT = Type("Timeout")
 MILLISECONDS = Type(UINT.name, units=(("ms", 1),))
-HANDLES = {"Channel"}
-OPERATIONS = {
-    "create_channel", "try_send", "try_receive", "send_blocking", "receive_blocking",
-    "send_timeout", "receive_timeout",
-}
 ENDING = frozenset({"ending"})
 ENUMS = {
     CAPACITY: {"Bounded": UINT.refined(), "Unbounded": None},
-    EMPTY: {"Empty": None},
-    NEVER: {},
-    TIMEOUT: {"Timeout": None},
+    **{Type(name): dict.fromkeys(op.cases) for name, op in ERROR_TYPES.items()
+       if not op.carries_message},
 }
 
 
 def variants(value_type):
-    if value_type.name in {"TrySendError", "SendTimeout"}:
-        case = "Full" if value_type.name == "TrySendError" else "Timeout"
-        return {case: value_type.arguments[0]}
+    operation = ERROR_TYPES.get(value_type.name)
+    if operation is not None and value_type.arguments:
+        return dict.fromkeys(operation.cases, value_type.arguments[0])
     return ENUMS.get(value_type)
 
 
 def signatures(node, handles, expected):
     name = node.token.text
-    if name == "create_channel":
-        if expected is None or expected.name != "Channel":
-            raise LanguageError(node.token, "create_channel needs an explicit Channel<T> result type")
+    operation = OPERATIONS[name]
+    handle_type = handle_name(operation.closable)
+    if operation.action == "create":
+        if expected is None or expected.name != handle_type:
+            raise LanguageError(node.token, f"{name} needs an explicit {handle_type}<T> result type")
         return (builtin(name, (("channels", CHANNELS), ("capacity", CAPACITY)), expected, ENDING),)
-    if not handles:
-        raise LanguageError(node.token, f"{name} requires a Channel<T> handle")
-    return tuple(operation(name, handle) for handle in handles)
+    candidates = [handle for handle in handles if handle.name == handle_type]
+    if not candidates:
+        raise LanguageError(node.token, f"{name} requires a {handle_type}<T> handle")
+    return tuple(signature(name, operation, handle) for handle in candidates)
 
 
-def operation(name, handle):
+def signature(name, operation, handle):
     message, = handle.arguments
-    blocking = name.endswith("_blocking")
-    timed = name.endswith("_timeout")
-    guarantees = frozenset() if blocking else ENDING
-    timeout = (("timeout", MILLISECONDS),) if timed else ()
-    if "receive" in name:
-        output = message if blocking else result_type(message, TIMEOUT if timed else EMPTY)
-        return builtin(name, (("channel", handle), *timeout), output, guarantees)
-    error = NEVER if blocking else Type("SendTimeout" if timed else "TrySendError", (message,))
-    signature = builtin(name, (("channel", handle), ("message", message), *timeout),
-                        result_type(UNIT, error), guarantees)
-    channel, payload, *rest = signature.parameters
-    return replace(signature, parameters=(channel, replace(payload, owning=not message.is_shared), *rest))
+    parameters = (("channel", handle),)
+    if operation.action == "close":
+        return builtin(name, parameters, UNIT, ENDING)
+    sending = operation.action == "send"
+    if sending:
+        parameters += (("message", message),)
+    if operation.mode == "timed":
+        parameters += (("timeout", MILLISECONDS),)
+    output = UNIT if sending else message
+    if operation.error_type:
+        error_arguments = (message,) if operation.carries_message else ()
+        output = result_type(output, Type(operation.error_type, error_arguments))
+    guarantees = frozenset() if operation.mode == "blocking" else ENDING
+    function = builtin(name, parameters, output, guarantees)
+    if sending and not message.is_shared:
+        channel, payload, *rest = function.parameters
+        return replace(function, parameters=(channel, replace(payload, owning=True), *rest))
+    return function

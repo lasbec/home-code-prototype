@@ -8,7 +8,7 @@ color brightcyan "\<(commutative|deterministic|pure|ending)\>"
 color brightcyan "\<(example|expect)\>" "\<(input|after)\>[[:blank:]]"
 
 color brightmagenta "\<(bool|channels|console|f64|filesystem|int32|list|random|result|string|threads|uint32|Uint32|unit)\>"
-color brightmagenta "\<(Capacity|Channel|Empty|TrySendError|HostError|HostErrorKind|IndexError|Killed|Thread|Overflow|ParseIntError|RandomDraw|Zero)\>"
+color brightmagenta "\<(Capacity|Channel|ClosableChannel|Closed|ClosedSend|Empty|Never|SendTimeout|Timeout|TryReceiveClosableError|TrySendError|TrySendClosableError|TimedReceiveClosableError|TimedSendClosableError|HostError|HostErrorKind|IndexError|Killed|Thread|Overflow|ParseIntError|RandomDraw|Zero)\>"
 color brightyellow "\<(false|true)\>" "(-|\<)[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?\>"
 color brightmagenta "\<(int32|uint32|Uint32)!0\>"
 
