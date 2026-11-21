@@ -4,10 +4,10 @@ from collections import defaultdict
 from dataclasses import dataclass, field, replace
 
 from .syntax import (
-    BOOL, CONSOLE, EXAMPLE_ERROR_MESSAGES, FILESYSTEM, FLOAT, GUARANTEES, HOST_ERROR, HOST_ERROR_KIND,
-    INDEX_ERROR, INT, OVERFLOW, PARSE_INT_ERROR, RANDOM, RANDOM_DRAW, SIMPLE_TYPES, STRING, UNIT, ZERO,
-    Argument, EnumDeclaration, Function, LanguageError, Node, Parameter, RecordDeclaration,
-    Token, Type, product_units, quotient_units, result_type,
+    BOOL, CAPABILITIES, CONSOLE, EXAMPLE_ERROR_MESSAGES, FILESYSTEM, FLOAT, GUARANTEES, HOST_ERROR,
+    HOST_ERROR_KIND, INDEX_ERROR, INT, OVERFLOW, PARSE_INT_ERROR, RANDOM, RANDOM_DRAW, SIMPLE_TYPES,
+    STRING, UNIT, ZERO, Argument, EnumDeclaration, Function, LanguageError, Node, Parameter,
+    RecordDeclaration, Token, Type, product_units, quotient_units, result_type,
 )
 
 
@@ -39,6 +39,8 @@ HOST_FUNCTIONS = {
                 result_type(INT, HOST_ERROR), commutative=("bound0", "bound1")),
     )
 }
+HOST_ERROR_CONSTRUCTOR = builtin("HostError", (("kind", HOST_ERROR_KIND), ("message", STRING)),
+                                 HOST_ERROR, GUARANTEES)
 PURE_FUNCTIONS = {
     function.name: function for function in (
         builtin("concat", (("left", STRING), ("right", STRING)), STRING, GUARANTEES),
@@ -54,7 +56,7 @@ PURE_FUNCTIONS = {
 GENERIC_FUNCTIONS = {"add", "subtract", "min", "max", "nonzero", "at", "prepend", "dropLast"}
 CONSTRUCTORS = {"Ok", "Err"}
 BUILTIN_NAMES = HOST_FUNCTIONS.keys() | PURE_FUNCTIONS.keys() | GENERIC_FUNCTIONS | CONSTRUCTORS
-EXAMPLE_VALUE_KINDS = {"value", "integer", "decimal", "list", "variant", "call"}
+LITERAL_VALUE_KINDS = {"value", "integer", "decimal", "list", "variant", "call"}
 
 
 @dataclass(frozen=True)
@@ -70,10 +72,10 @@ class Flow:
     bindings: dict = field(default_factory=dict)
     nonzero: set = field(default_factory=set)
     protected: frozenset = frozenset()
-    literals_only: bool = False
+    literal_context: str | None = None
 
     def copy(self):
-        return Flow(self.bindings.copy(), self.nonzero.copy(), self.protected, self.literals_only)
+        return Flow(self.bindings.copy(), self.nonzero.copy(), self.protected, self.literal_context)
 
     def type_of(self, name):
         declared = self.bindings[name].type
@@ -149,7 +151,12 @@ def merge_proofs(flow, branches):
 
 
 class Checker:
-    def __init__(self, declarations, *, module=None, imports=None, entry=True):
+    def __init__(self, declarations, *, module=None, imports=None, entry=True, mock=None):
+        self.mock_header = mock
+        self.mock_operations = {} if mock is None else {
+            name: function for name, function in HOST_FUNCTIONS.items()
+            if function.parameters[0].type == CAPABILITIES[mock.text]
+        }
         self.functions = {}
         self.imported_functions = {}
         self.record_names = {RANDOM_DRAW.name: RANDOM_DRAW}
@@ -177,11 +184,19 @@ class Checker:
                 if function.exported
             })
         self.current_function = None
-        used_names = set(BUILTIN_NAMES) | {RANDOM_DRAW.name}
+        used_names = (BUILTIN_NAMES - self.mock_operations.keys()) | {RANDOM_DRAW.name}
         builtin_types = SIMPLE_TYPES | {"int32", "f64", "result", "list"}
         for declaration in declarations:
             token = declaration.token
             name = token.text
+            mock_export = (isinstance(declaration, Function) and name in self.mock_operations
+                           and declaration.exported)
+            if mock and declaration.exported and not mock_export:
+                raise LanguageError(token, f"unexpected export '{name}' in {mock.text} mock")
+            if name in self.mock_operations and not mock_export:
+                raise LanguageError(token, f"mock operation '{name}' must be exported as a function")
+            if mock and name == HOST_ERROR.name:
+                raise LanguageError(token, f"name '{name}' is already in use")
             if name in used_names or (not isinstance(declaration, Function) and name in builtin_types):
                 raise LanguageError(token, f"name '{name}' is already in use")
             used_names.add(name)
@@ -211,11 +226,40 @@ class Checker:
             else:
                 function = replace(declaration, module=module)
                 self.functions[name] = function
-                self.check_signature(function, entry)
-                if function.exported:
+                self.check_signature(function, entry and mock is None)
+                if function.exported and not mock_export:
                     self.check_public_type(function.output, token)
                     for parameter in function.parameters:
                         self.check_public_type(parameter.type, parameter.token)
+
+        self.state_type = self.check_mock_contract() if mock else None
+
+    def check_mock_contract(self):
+        state_type = None
+        for name, host in self.mock_operations.items():
+            function = self.functions.get(name)
+            if function is None:
+                raise LanguageError(self.mock_header, f"{self.mock_header.text} mock is missing export '{name}'")
+            parameters = function.parameters
+            signature = tuple((p.name, p.type, p.mutable) for p in parameters[1:])
+            if (not parameters or parameters[0].name != "state" or not parameters[0].mutable
+                    or signature != tuple((p.name, p.type, p.mutable) for p in host.parameters[1:])
+                    or function.output != host.output
+                    or function.commutative_slots != host.commutative_slots):
+                remaining = [f"{p.name}: {p.type}" for p in host.parameters[1:]]
+                arguments = ", ".join(["state: mut <state type>", *remaining])
+                commutative = f"commutative {' '.join(host.commutative)} " if host.commutative else ""
+                raise LanguageError(function.token,
+                                    f"mock export must match '{commutative}fn {name}({arguments}) -> {host.output}'")
+            state = parameters[0]
+            if state_type is None:
+                state_type = state.type
+            elif state.type != state_type:
+                raise LanguageError(state.token, f"expected shared mock state type {state_type}, found {state.type}")
+        init = self.functions.get("init")
+        if init and (init.parameters or init.output != state_type or not {"pure", "ending"} <= init.modifiers):
+            raise LanguageError(init.token, f"mock initializer must match 'pure ending fn init() -> {state_type}'")
+        return state_type
 
     def check_public_type(self, value_type, token):
         if value_type in self.private_types:
@@ -276,7 +320,8 @@ class Checker:
         callers = defaultdict(set)
         for function in checked.values():
             for parameter in function.parameters:
-                if parameter.mutable:
+                # The interface always passes state by reference, even for read-only operations.
+                if parameter.mutable and function.name not in self.mock_operations:
                     declarations[parameter.token] = "parameter"
             for node in walk(function.body):
                 if node.kind == "let" and node.fields[2]:
@@ -310,7 +355,7 @@ class Checker:
         inputs = {}
         after = {}
         output = None
-        flow = Flow(literals_only=True)
+        flow = Flow(literal_context="example")
         for entry in example.entries:
             kind = entry.token.text
             if kind == "expect":
@@ -522,10 +567,13 @@ class Checker:
             raise LanguageError(node.token, f"expected {expected}, found {checked.type}")
         return checked
 
+    def literal(self, node, expected):
+        return self.expression(node, Flow(literal_context="mock state"), expected).node
+
     def infer(self, node, flow, expected):
         kind, fields = node.kind, node.fields
-        if flow.literals_only and kind not in EXAMPLE_VALUE_KINDS:
-            raise LanguageError(node.token, "example values must be literals")
+        if flow.literal_context and kind not in LITERAL_VALUE_KINDS:
+            raise LanguageError(node.token, f"{flow.literal_context} values must be literals")
         if kind == "value":
             value, value_type = fields
             return Checked(value_type, Node(node.token, kind, (value,)))
@@ -704,14 +752,23 @@ class Checker:
             return Checked(expected, Node(node.token, "result", (name, value.node)))
         if name in self.record_names:
             return self.construct_record(node, name, flow)
-        if flow.literals_only:
+        if self.mock_header and name == HOST_ERROR.name:
+            value = self.bind_arguments(node, name, HOST_ERROR_CONSTRUCTOR, flow)
+            _, plan, _ = value.node.fields
+            return Checked(HOST_ERROR, Node(node.token, "host_failure", (plan,)))
+        if flow.literal_context:
             if name in EXAMPLE_ERROR_MESSAGES:
                 return self.example_error(node, flow)
-            raise LanguageError(node.token, "example values must be literals; ordinary calls are not allowed")
+            raise LanguageError(node.token, f"{flow.literal_context} values must be literals; "
+                                "ordinary calls are not allowed")
         if name == "prepend":
             return self.prepend(node, flow, expected)
         signature = (self.functions.get(name) or self.imported_functions.get(name)
-                     or HOST_FUNCTIONS.get(name) or PURE_FUNCTIONS.get(name))
+                     or PURE_FUNCTIONS.get(name))
+        if signature is None and name in HOST_FUNCTIONS:
+            if self.mock_header:
+                raise LanguageError(node.token, f"mock files cannot call live host function '{name}'")
+            signature = HOST_FUNCTIONS[name]
         if name in GENERIC_FUNCTIONS:
             signature = self.generic_signature(name, arguments, flow, expected)
         if signature is None:

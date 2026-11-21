@@ -59,6 +59,7 @@ UNIT = Type("unit")
 CONSOLE = Type("console")
 FILESYSTEM = Type("filesystem")
 RANDOM = Type("random")
+CAPABILITIES = {capability.name: capability for capability in (CONSOLE, FILESYSTEM, RANDOM)}
 RANDOM_DRAW = Type("RandomDraw")
 OVERFLOW = Type("Overflow")
 ZERO = Type("Zero")
@@ -221,6 +222,7 @@ class Parser:
         self.tokens = list(tokenize(source, filename))
         self.index = 0
         self.data_types = {}
+        self.mock = None
         depth = 0
         for index, token in enumerate(self.tokens):
             if token.kind == "punct" and token.text == "{":
@@ -265,6 +267,14 @@ class Parser:
                 raise LanguageError(path, "expected a quoted import path")
             self.accept(";")
             yield path, decode_string(path)
+
+    def mock_header(self):
+        if self.accept("mock"):
+            environment = self.name()
+            if environment.text not in CAPABILITIES:
+                raise LanguageError(environment, f"unknown mock environment '{environment.text}'")
+            self.mock = environment
+        return self.mock
 
     def qualified_name(self, token):
         if not self.accept("."):
@@ -327,6 +337,11 @@ class Parser:
             self.expect(";")
         return Example(token, description, tuple(entries))
 
+    def literal(self):
+        value = self.expression()
+        self.expect("<end of file>")
+        return value
+
     def separated(self, end, read):
         items = []
         while self.current.text != end:
@@ -358,6 +373,8 @@ class Parser:
     def type(self):
         token = self.qualified_name(self.take())
         name = token.text
+        if self.mock and name in CAPABILITIES:
+            raise LanguageError(token, f"mock files cannot use host capability type '{name}'")
         if name in SIMPLE_TYPES:
             return Type(name)
         if name == "list":

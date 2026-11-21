@@ -39,6 +39,37 @@ The host functions run immediately when called. `write` flushes text as supplied
 
 `random(source, bound0, bound1)` draws a uniform integer from the inclusive range. `pseudoRandom(state: seed, bound0, bound1)` is a pure, deterministic, terminating built-in for repeatable sequences. It returns a `RandomDraw` record with `value` and the next `state`, both `int32`. Pass the returned state into the next call. Each call takes one generator step, even when the bounds are equal. Both functions accept the bounds in either order. `pseudoRandom` maps its 32-bit outputs as evenly as possible across the range and is intended for simulations and games.
 
+## Mock host environments
+
+A mock is a self-contained `.proto` file that starts with `mock console`, `mock filesystem`, or `mock random`. Export every function for that environment in the host function table and keep other declarations private. Each export replaces the host capability parameter with `state: mut T`, where `T` is the same type across all exports. The remaining parameters, result type, and commutative group match the host signature. The mock can use host-independent built-ins and construct `HostError(kind: HostErrorKind::Other, message: "details")`.
+
+For example, this `seeded.proto` replaces live randomness with the language's seeded generator.
+
+```text
+mock random
+
+pure ending fn init() -> int32 { return 42; }
+
+export commutative bound0 bound1
+fn random(state: mut int32, bound0: int32, bound1: int32) -> result<int32, HostError> {
+    let draw = pseudoRandom(state: state, bound0, bound1);
+    state = draw.state;
+    return Ok(draw.value);
+}
+```
+
+Use a bare flag for a live environment and `--environment=PATH` for a mock. A run can mix providers for different environments. This example uses live console and filesystem access with mocked randomness.
+
+```sh
+python3 -B -m prototype check seeded.proto --random-state=seed.literal
+python3 -B -m prototype run examples/snake.proto --console --filesystem \
+    --random=seeded.proto --random-state=seed.literal --random-state-out=next-seed.literal
+```
+
+`seed.literal` contains one Home Code literal such as `123`. The runner checks its type before calling `main`. If you omit the fixture, the runner calls a private `pure ending fn init()` returning the state type. A mock with `unit` state can omit both. Each run starts with fresh state, and all calls to that mock share it.
+
+The runner writes the final literal when `main` returns, including when it returns `Err`. Interruptions and interpreter failures before `main` returns leave the output path untouched. You can pass the final state file back as a fixture for another run.
+
 ## Play Snake
 
 ```sh
@@ -97,7 +128,7 @@ deterministic ending fn setDuration(elapsed: mut int32!0<seconds>) -> unit {
 
 Provide one named `input` per parameter, one `expect` for the return value, and one named `after` per `mut` parameter, even when that example leaves the value unchanged. Each mutable input gets independent storage. Entries can appear in any order.
 
-Values can use numbers, strings, booleans, `unit`, lists, named record fields, enum cases, `Ok`, and `Err`, with literal values throughout. Built-in errors use `Overflow()`, `Zero()`, `IndexError("message")`, or `ParseIntError("message")` inside examples. Host capabilities and `HostError` are opaque. Values are compared structurally, including error messages, with exact numeric equality for `f64`.
+Values can use numbers, strings, booleans, `unit`, lists, named record fields, enum cases, `Ok`, and `Err`, with literal values throughout. Built-in errors use `Overflow()`, `Zero()`, `IndexError("message")`, or `ParseIntError("message")` inside examples. Host capabilities are opaque. Examples in mock files can also construct `HostError` values. Values are compared structurally, including error messages, with exact numeric equality for `f64`.
 
 `check` and `run` validate examples. `test` runs examples in source order, reports every mismatch in a case, and exits nonzero when any case fails. It can run files without `main`.
 

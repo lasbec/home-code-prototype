@@ -12,6 +12,11 @@ from .syntax import LanguageError, NAME_PATTERN, Parser, RESERVED
 class Program:
     entry: str
     functions: dict
+    mock: Checker | None = None
+
+    def load_state(self, path):
+        parser = Parser(path.read_text(encoding="utf-8"), filename=str(path))
+        return self.mock.literal(parser.literal(), self.mock.state_type)
 
 
 class ModuleLoader:
@@ -22,11 +27,11 @@ class ModuleLoader:
 
     def load(self, source):
         path = source.resolve()
-        self.visit(source, path)
+        scope = self.visit(source, path)
         functions = {
             key: function for module in self.checked.values() for key, function in module.items()
         }
-        return Program(str(path), functions)
+        return Program(str(path), functions, scope if scope.mock_header else None)
 
     def visit(self, source, path=None, import_token=None):
         try:
@@ -37,7 +42,10 @@ class ModuleLoader:
                 chain = " -> ".join(item.name for item in cycle)
                 raise LanguageError(import_token, f"circular import: {chain}")
             if path in self.scopes:
-                return self.scopes[path]
+                scope = self.scopes[path]
+                if import_token and scope.mock_header:
+                    raise LanguageError(import_token, "mock files cannot be imported")
+                return scope
             contents = path.read_text(encoding="utf-8")
         except (OSError, ValueError, RuntimeError) as error:
             if import_token is None:
@@ -47,6 +55,13 @@ class ModuleLoader:
         self.active.append(path)
         self.checked[path] = {}
         parser = Parser(contents, filename=str(source), module=str(path))
+        mock = parser.mock_header()
+        if mock and import_token:
+            raise LanguageError(import_token, "mock files cannot be imported")
+        if mock and source.suffix != ".proto":
+            raise LanguageError(mock, "mock source must be a .proto file")
+        if mock and parser.current.text == "import":
+            raise LanguageError(parser.current, "mock files cannot import other files")
         imports = {}
         for token, text in parser.imports():
             relative = Path(text)
@@ -63,7 +78,8 @@ class ModuleLoader:
                 f"{namespace}.{name}": value_type for name, value_type in dependency.public_types.items()
             })
 
-        scope = Checker(parser.program(), module=str(path), imports=imports, entry=import_token is None)
+        scope = Checker(parser.program(), module=str(path), imports=imports,
+                        entry=import_token is None, mock=mock)
         self.checked[path] = scope.program()
         self.scopes[path] = scope
         self.active.pop()

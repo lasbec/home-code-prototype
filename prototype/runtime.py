@@ -11,6 +11,7 @@ from select import select
 from tempfile import NamedTemporaryFile
 from time import monotonic
 
+from .checker import HOST_FUNCTIONS
 from .syntax import EXAMPLE_ERROR_MESSAGES
 
 try:
@@ -42,12 +43,20 @@ class Variant:
     name: str
     tag: str
     value: object = None
+    has_payload: bool = field(default=False, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
 class Failure:
     code: str
     message: str = ""
+
+
+@dataclass(frozen=True)
+class MockCapability:
+    environment: str
+    module: str
+    state: Cell
 
 
 @dataclass
@@ -213,25 +222,29 @@ def write_file(filesystem, path, text):
         return Result("Err", Failure("WriteError", str(error)))
 
 
-def replace_file(filesystem, path, text):
+def write_atomic(destination, text):
     temporary = None
     try:
-        destination = Path(path)
         content = text.encode("utf-8")
         with NamedTemporaryFile(dir=destination.parent, delete=False) as file:
             temporary = Path(file.name)
             file.write(content)
         os.replace(temporary, destination)
         temporary = None
-        return Result("Ok", None)
-    except (OSError, UnicodeError, ValueError) as error:
-        return Result("Err", Failure("WriteError", str(error)))
     finally:
         if temporary is not None:
             try:
                 temporary.unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+def replace_file(filesystem, path, text):
+    try:
+        write_atomic(Path(path), text)
+        return Result("Ok", None)
+    except (OSError, UnicodeError, ValueError) as error:
+        return Result("Err", Failure("WriteError", str(error)))
 
 
 def checked_int(value):
@@ -311,6 +324,9 @@ class Interpreter:
         self.functions = functions
 
     def call(self, name, arguments):
+        if name in HOST_FUNCTIONS and isinstance(arguments[0], MockCapability):
+            capability = arguments[0]
+            return self.call((capability.module, name), (capability.state, *arguments[1:]))
         if name in BUILTINS:
             return BUILTINS[name](*arguments)
         function = self.functions[name]
@@ -402,10 +418,13 @@ class Interpreter:
         if kind == "failure":
             code, message = fields
             return Failure(code, "" if message is None else self.expression(message, environment))
+        if kind == "host_failure":
+            error_kind, message = self.arguments(fields[0], environment)
+            return Failure(error_kind.tag, message)
         if kind == "variant":
             name, tag, payload = fields
             value = None if payload is None else self.expression(payload, environment)
-            return Variant(name, tag, value)
+            return Variant(name, tag, value, has_payload=payload is not None)
         if kind == "record":
             name, labels, plan = fields
             arguments = self.arguments(plan, environment)
@@ -440,7 +459,9 @@ def display(value, *, literal=False):
         return f"{value.tag}({display(value.value, literal=literal)})"
     if isinstance(value, Variant):
         tag = f"{value.name}::{value.tag}"
-        return tag if value.value is None else f"{tag}({display(value.value, literal=literal)})"
+        if value.value is not None or (literal and value.has_payload):
+            return f"{tag}({display(value.value, literal=literal)})"
+        return tag
     if isinstance(value, Record):
         fields = ", ".join(f"{name}: {display(field, literal=literal)}" for name, field in value.fields)
         return f"{value.name}({fields})"
@@ -448,6 +469,9 @@ def display(value, *, literal=False):
         if literal and value.code in EXAMPLE_ERROR_MESSAGES:
             message = display(value.message, literal=True) if EXAMPLE_ERROR_MESSAGES[value.code] else ""
             return f"{value.code}({message})"
+        if literal:
+            message = display(value.message, literal=True)
+            return f"HostError(HostErrorKind::{host_error_kind(value).tag}, {message})"
         return f"{value.code}: {value.message}" if value.message else value.code
     if isinstance(value, tuple):
         return "[" + ", ".join(display(item, literal=literal) for item in value) + "]"
@@ -455,4 +479,6 @@ def display(value, *, literal=False):
         return type(value).__name__.lower()
     if isinstance(value, RandomSource):
         return "random"
+    if isinstance(value, MockCapability):
+        return value.environment
     return str(value)
