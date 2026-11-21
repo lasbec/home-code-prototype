@@ -1,0 +1,10 @@
+// This case deliberately expects the wrong return value and final mutable value.
+example "reports both mismatches" {
+    input elapsed: 5;
+    expect 5;
+    after elapsed: 5;
+}
+deterministic terminates fn setDuration(elapsed: mut int32<seconds>) -> int32<seconds> {
+    elapsed = 3;
+    return elapsed;
+}
