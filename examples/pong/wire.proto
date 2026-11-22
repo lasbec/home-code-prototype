@@ -1,0 +1,160 @@
+import "../lib/json.proto"
+import "./game.proto"
+
+export record Command { id: string, step: int32 }
+export record Frame {
+    seat: int32, phase: string, left: game.Paddle, right: game.Paddle, x: int32, y: int32, serving: bool
+}
+
+export pure deterministic ending fn ended(frame: Frame) -> bool {
+    if frame.phase == "finished" { return true; }
+    return frame.phase == "aborted";
+}
+
+export fn playerId(source: random) -> result<string, HostError> {
+    match random(source, 0, 2147483647) {
+        Err(error) { return Err(error); }
+        Ok(first) {
+            match random(source, 0, 2147483647) {
+                Err(error) { return Err(error); }
+                Ok(second) {
+                    let tail = concat(left: "-", right: formatInt32(second));
+                    return Ok(concat(left: formatInt32(first), right: tail));
+                }
+            }
+        }
+    }
+}
+
+pure ending fn field(value: json.JsonValue, key: string) -> json.JsonValue {
+    match json.access(value, path: [json.JsonPathSegment::Key(key)]) {
+        Ok(child) { return child; }
+        Err(error) { return json.JsonValue::Null; }
+    }
+}
+
+pure ending fn number(value: json.JsonValue, key: string) -> int32 {
+    match field(value, key) {
+        Number(text) {
+            match parseInt32(text) {
+                Ok(parsed) { return parsed; }
+                Err(error) { return -2147483648; }
+            }
+        }
+        Null { return -2147483648; }
+        Bool(flag) { return -2147483648; }
+        String(text) { return -2147483648; }
+        Array(items) { return -2147483648; }
+        Object(members) { return -2147483648; }
+    }
+}
+
+pure ending fn string(value: json.JsonValue, key: string) -> string {
+    match field(value, key) {
+        String(text) { return text; }
+        Null { return ""; }
+        Bool(flag) { return ""; }
+        Number(text) { return ""; }
+        Array(items) { return ""; }
+        Object(members) { return ""; }
+    }
+}
+
+pure ending fn validId(id: string) -> bool {
+    let mut count = 0;
+    let points = codePoints(id);
+    for point in points {
+        if point < 45 { return false; }
+        if point > 57 { return false; }
+        if point == 46 { return false; }
+        if point == 47 { return false; }
+        count = game.sum(base: count, delta: 1);
+        if count > 24 { return false; }
+    }
+    return count > 0;
+}
+
+export pure ending fn decodeCommand(body: string, joining: bool) -> result<Command, string> {
+    match json.parse(body) {
+        Err(error) { return Err("Invalid JSON"); }
+        Ok(value) {
+            let id = string(value, key: "id");
+            if validId(id) == false { return Err("Invalid player ID"); }
+            let mut step = 0;
+            if joining == false {
+                step = number(value, key: "step");
+                if step < -1 { return Err("Step must be -1, 0 or 1"); }
+                if step > 1 { return Err("Step must be -1, 0 or 1"); }
+            }
+            return Ok(Command(id: id, step: step));
+        }
+    }
+}
+
+pure ending fn text(key: string, data: string) -> json.JsonMember {
+    return json.JsonMember(key: key, value: json.JsonValue::String(data));
+}
+
+pure ending fn integer(key: string, data: int32) -> json.JsonMember {
+    return json.JsonMember(key: key, value: json.JsonValue::Number(formatInt32(data)));
+}
+
+pure ending fn encode(members: list<json.JsonMember>) -> string {
+    match json.serialize(json.JsonValue::Object(members)) {
+        Ok(body) { return body; }
+        Err(error) { return "{}"; }
+    }
+}
+
+export pure ending fn request(path: string, id: string, step: int32) -> HttpRequest {
+    return HttpRequest(method: "POST", path: path, headers: [HttpHeader(name: "Content-Type", value: "application/json")],
+                       body: encode([text(key: "id", data: id), integer(key: "step", data: step)]));
+}
+
+export pure ending fn message(status: uint32, explanation: string) -> HttpResponse {
+    return HttpResponse(status: status, headers: [HttpHeader(name: "Content-Type", value: "application/json")],
+                        body: encode([text(key: "error", data: explanation)]));
+}
+
+export pure ending fn frameResponse(seat: int32, phase: string, court: game.Court) -> HttpResponse {
+    let mut serving = 0;
+    if court.serve > 0 { serving = 1; }
+    let body = encode([integer(key: "seat", data: seat), text(key: "phase", data: phase),
+                       integer(key: "left", data: court.left.center), integer(key: "right", data: court.right.center),
+                       integer(key: "leftScore", data: court.left.score), integer(key: "rightScore", data: court.right.score),
+                       integer(key: "x", data: court.ball.x), integer(key: "y", data: court.ball.y),
+                       integer(key: "serving", data: serving)]);
+    return HttpResponse(status: 200, headers: [HttpHeader(name: "Content-Type", value: "application/json")], body: body);
+}
+
+export pure ending fn decodeFrame(body: string) -> result<Frame, string> {
+    match json.parse(body) {
+        Err(error) { return Err("Server sent invalid JSON"); }
+        Ok(value) {
+            let seat = number(value, key: "seat");
+            let phase = string(value, key: "phase");
+            let left = game.Paddle(center: number(value, key: "left"), score: number(value, key: "leftScore"));
+            let right = game.Paddle(center: number(value, key: "right"), score: number(value, key: "rightScore"));
+            let x = number(value, key: "x");
+            let y = number(value, key: "y");
+            let serving = number(value, key: "serving");
+            if seat < 1 { return Err("Invalid player seat"); }
+            if seat > 2 { return Err("Invalid player seat"); }
+            if phase != "waiting" {
+                if phase != "playing" {
+                    if phase != "finished" {
+                        if phase != "aborted" { return Err("Invalid match phase"); }
+                    }
+                }
+            }
+            if left.center != max(2, min(17, left.center)) { return Err("Invalid left paddle"); }
+            if right.center != max(2, min(17, right.center)) { return Err("Invalid right paddle"); }
+            if left.score != max(0, min(5, left.score)) { return Err("Invalid left score"); }
+            if right.score != max(0, min(5, right.score)) { return Err("Invalid right score"); }
+            if x != max(4, min(game.lastBallColumn(), x)) { return Err("Invalid ball column"); }
+            if y != max(0, min(19, y)) { return Err("Invalid ball row"); }
+            if serving != max(0, min(1, serving)) { return Err("Invalid serve indicator"); }
+            return Ok(Frame(seat: seat, phase: phase, left: left, right: right, x: x, y: y, serving: serving == 1));
+        }
+    }
+}

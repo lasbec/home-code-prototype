@@ -8,6 +8,7 @@ import sqlite3
 import sys
 
 from .channels.buffer import Channels
+from .http_io import HttpClient, HttpServer
 from .modules import ModuleLoader
 from .runtime import (
     Cell, Console, Filesystem, Interpreter, MockCapability, RandomSource, display, write_atomic,
@@ -60,11 +61,16 @@ def report_error(source, error):
 
 def add_state_options(command, *, output=False):
     for environment in MOCK_CAPABILITIES:
-        command.add_argument(f"--{environment}-state", type=Path, metavar="FILE",
+        flag = capability_flag(environment)
+        command.add_argument(f"{flag}-state", dest=f"{environment}_state", type=Path, metavar="FILE",
                              help=f"read initial state for the {environment} mock")
         if output:
-            command.add_argument(f"--{environment}-state-out", type=Path, metavar="FILE",
+            command.add_argument(f"{flag}-state-out", dest=f"{environment}_state_out", type=Path, metavar="FILE",
                                  help=f"save final state for the {environment} mock")
+
+
+def capability_flag(environment):
+    return "--" + environment.replace("_", "-")
 
 
 def cli_arguments(arguments):
@@ -76,7 +82,7 @@ def cli_arguments(arguments):
         if argument == "--":
             return result + arguments[index:]
         option, equals, path = argument.partition("=")
-        environment = option[2:]
+        environment = option[2:].replace("-", "_")
         if equals and option.startswith("--") and environment in MOCK_CAPABILITIES:
             argument = f"--_{environment}-mock={path}"
         result.append(argument)
@@ -86,12 +92,13 @@ def cli_arguments(arguments):
 def load_mocks(args, cli):
     mocks = {}
     for environment in MOCK_CAPABILITIES:
+        flag = capability_flag(environment)
         paths = getattr(args, f"_{environment}_mock") or []
         state = getattr(args, f"{environment}_state")
         output = getattr(args, f"{environment}_state_out")
         if not paths:
             if state is not None or output is not None:
-                cli.error(f"{environment} state options require --{environment}=MOCK")
+                cli.error(f"{environment} state options require {flag}=MOCK")
             continue
         if len(paths) > 1 or getattr(args, environment):
             cli.error(f"select one provider for {environment}")
@@ -103,7 +110,7 @@ def load_mocks(args, cli):
                 raise ValueError(f"expected a 'mock {environment}' header")
             header = provider.mock.mock_header
             if header.text != environment:
-                raise LanguageError(header, f"--{environment} requires 'mock {environment}', found 'mock {header.text}'")
+                raise LanguageError(header, f"{flag} requires 'mock {environment}', found 'mock {header.text}'")
             fixture = None
             if state is not None:
                 source = state
@@ -136,11 +143,14 @@ def main():
     run = commands.add_parser("run", help="validate and run main")
     run.add_argument("source", type=Path)
     for environment in CAPABILITIES:
+        flag = capability_flag(environment)
         help_text = f"grant the {environment} capability"
         if environment in MOCK_CAPABILITIES:
-            help_text += f", or use --{environment}=MOCK to load a .proto mock"
+            help_text += f", or use {flag}=MOCK to load a .proto mock"
             run.add_argument(f"--_{environment}-mock", action="append", type=Path, help=argparse.SUPPRESS)
-        run.add_argument(f"--{environment}", action="store_true", help=help_text)
+        run.add_argument(flag, dest=environment, action="store_true", help=help_text)
+    run.add_argument("--http-origin", help="fixed http:// origin for the live HTTP client")
+    run.add_argument("--http-bind", help="bind IP and port for the live HTTP server")
     add_state_options(run, output=True)
     args = cli.parse_args(cli_arguments(sys.argv[1:]))
     if args.command in {"save", "export"}:
@@ -191,7 +201,15 @@ def main():
     for parameter in entry.parameters:
         environment = parameter.type.name
         if environment not in mocks and not getattr(args, environment):
-            cli.error(f"main requires --{environment}")
+            cli.error(f"main requires {capability_flag(environment)}")
+    for enabled, value, grant, setting in (
+        (args.http_client, args.http_origin, "--http-client", "--http-origin"),
+        (args.http_server, args.http_bind, "--http-server", "--http-bind"),
+    ):
+        if enabled and value is None:
+            cli.error(f"{grant} requires {setting}")
+        if value is not None and not enabled:
+            cli.error(f"{setting} requires the live {grant} capability")
     capabilities = {}
     if args.console:
         capabilities["console"] = Console(sys.stdin, sys.stdout)
@@ -209,6 +227,12 @@ def main():
     interpreter = Interpreter(functions)
     try:
         with ExitStack() as cleanup:
+            if args.http_client:
+                client = capabilities["http_client"] = HttpClient(args.http_origin)
+                cleanup.callback(client.close)
+            if args.http_server:
+                server = capabilities["http_server"] = HttpServer(args.http_bind)
+                cleanup.callback(server.close)
             if args.console:
                 previous = signal.signal(signal.SIGTERM, terminate)
                 cleanup.callback(signal.signal, signal.SIGTERM, previous)
@@ -235,7 +259,7 @@ def main():
     except RecursionError:
         print("prototype interpreter reached its call stack limit", file=sys.stderr)
         return 1
-    except (OSError, RuntimeError) as error:
+    except (OSError, ValueError, RuntimeError) as error:
         print(error, file=sys.stderr)
         return 1
     if value is not None:

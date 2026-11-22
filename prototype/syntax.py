@@ -82,7 +82,11 @@ FILESYSTEM = Type("filesystem")
 RANDOM = Type("random")
 THREADS = Type("threads")
 CHANNELS = Type("channels")
-MOCK_CAPABILITIES = {capability.name: capability for capability in (CONSOLE, FILESYSTEM, RANDOM)}
+HTTP_CLIENT = Type("http_client")
+HTTP_SERVER = Type("http_server")
+MOCK_CAPABILITIES = {
+    capability.name: capability for capability in (CONSOLE, FILESYSTEM, RANDOM, HTTP_CLIENT, HTTP_SERVER)
+}
 CAPABILITIES = {**MOCK_CAPABILITIES, THREADS.name: THREADS, CHANNELS.name: CHANNELS}
 SHARED_HANDLES = {"Thread"} | CHANNEL_HANDLES
 GENERIC_TYPES = {
@@ -112,6 +116,7 @@ SIMPLE_TYPES = (
                                OVERFLOW, ZERO, INDEX_ERROR, HOST_ERROR, HOST_ERROR_KIND, PARSE_INT_ERROR,
                                UNICODE_ERROR)
     }
+    | {"HttpHeader", "HttpRequest", "HttpResponse", "HttpIncoming"}
 )
 
 

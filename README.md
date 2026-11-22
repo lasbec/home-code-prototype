@@ -73,7 +73,7 @@ Use `create_closable_channel` with a `ClosableChannel<T>` result type when produ
 
 ## Mock host environments
 
-A mock is a self-contained `.proto` file that starts with `mock console`, `mock filesystem`, or `mock random`. Export every function for that environment in the host function table and keep other declarations private. Each export replaces the host capability parameter with `state: mut T`, where `T` is the same type across all exports. The remaining parameters, result type, and commutative group match the host signature. The mock can use host-independent built-ins and construct `HostError(kind: HostErrorKind::Other, message: "details")`.
+A mock is a self-contained `.proto` file that starts with `mock console`, `mock filesystem`, `mock random`, `mock http_client`, or `mock http_server`. Export every host function for that environment and keep other declarations private. Each export replaces the host capability parameter with `state: mut T`, where `T` is the same type across all exports. The remaining parameters, result type, and commutative group match the host signature. The mock can use host-independent built-ins and construct `HostError(kind: HostErrorKind::Other, message: "details")`.
 
 For example, this `seeded.proto` replaces live randomness with the language's seeded generator.
 
@@ -101,6 +101,53 @@ python3 -B -m prototype run examples/snake.proto --console --filesystem \
 `seed.literal` contains one Home Code literal such as `123`. The runner checks its type before calling `main`. If you omit the fixture, the runner calls a private `pure ending fn init()` returning the state type. A mock with `unit` state can omit both. Each run starts with fresh state, and all calls to that mock share it.
 
 The runner writes the final literal when `main` returns, including when it returns `Err`. Interruptions and interpreter failures before `main` returns leave the output path untouched. You can pass the final state file back as a fixture for another run.
+
+## HTTP
+
+The runner grants `http_client` with `--http-client --http-origin http://HOST:PORT` and `http_server` with `--http-server --http-bind IP:PORT`. A client supplies an origin-relative path such as `/input`. Each valid HTTP response, including a redirect or an error status, comes back to the program with its status and body.
+
+| Host function | Result |
+| --- | --- |
+| `requestHttp(client: http_client, request: HttpRequest, timeout: uint32<ms>)` | `result<HttpResponse, HostError>` |
+| `acceptHttp(server: http_server, timeout: uint32<ms>)` | `result<HttpIncoming, HostError>` |
+| `respondHttp(server: http_server, incoming: own HttpIncoming, response: HttpResponse, timeout: uint32<ms>)` | `result<unit, HostError>` |
+
+`HttpRequest` has `method`, `path`, `headers`, and `body` fields. `HttpResponse` has `status: uint32`, `headers`, and `body`. Headers are a `list<HttpHeader>` with string fields `name` and `value`. Received names are lowercase. The host sets the connection and message framing headers. Bodies are buffered UTF-8 strings limited to 64 KiB each. Use `Content-Length` for inbound requests with a body. The server handles one request per connection with up to eight connections in progress.
+
+`HttpIncoming` contains a request and an ID. In a live server, the thread that accepted the request can respond once with the returned value. The host closes the connection if that thread exits before responding and caps each incoming connection's lifetime at five seconds. An elapsed operation deadline returns `HostErrorKind::Timeout`. HTTP operations park only the calling thread while they wait. With `--threads`, `sleep(threads, duration: uint32<ms>)` also parks only the caller.
+
+For scripted tests, use `--http-client=MOCK.proto` or `--http-server=MOCK.proto` with the matching mock header. Server mocks construct `HttpIncoming(id: ..., request: ...)` values as test input and receive them back through `respondHttp`.
+
+## Play Pong over the LAN
+
+On the host machine, bind the Pong server to an address that both players can reach. This command listens on all IPv4 interfaces on port 8080.
+
+```sh
+python3 -B -m prototype run examples/pong/server.proto \
+    --http-server --http-bind 0.0.0.0:8080 --console --threads --channels
+```
+
+Run one client per player in a UTF-8 terminal of at least 100 columns and 24 rows. Substitute the server's LAN address for `192.168.1.20` below. For two terminals on the server machine, use `127.0.0.1`.
+
+```sh
+python3 -B -m prototype run examples/pong/client.proto \
+    --http-client --http-origin http://192.168.1.20:8080 --console --threads --channels --random
+```
+
+The 96 × 20 court shows the cyan and magenta paddles, the ball, both scores, and your assigned side. Press **W** and **S** to move and **Q** to quit. The first player to five wins. If a player stops checking in for five seconds, the server ends the match and opens both seats for a new one. Press **R** on the results screen to join another match.
+
+The ball speeds up along a logarithmic curve, reaching its top speed after about one minute of active play. Each new match starts at the opening speed.
+
+### Play against the bot
+
+Start the server and one regular client, then run the bot in a separate terminal. The bot takes the available seat and predicts where the ball will reach its paddle, accounting for wall bounces. It prints the score when the match ends, then joins a new match and waits for an opponent. Use **Ctrl+C** to stop it.
+
+```sh
+python3 -B -m prototype run examples/pong/bot.proto \
+    --http-client --http-origin http://127.0.0.1:8080 --console --threads --random
+```
+
+Use the server's LAN address in `--http-origin` when running the bot on another machine.
 
 ## Play Snake
 

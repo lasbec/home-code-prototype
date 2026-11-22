@@ -1,0 +1,184 @@
+import "./game.proto"
+import "./wire.proto"
+
+record Motion { x: int32, y: int32, horizontal: int32, vertical: int32, verticalNext: bool }
+
+pure ending fn observe(previous: Motion, frame: wire.Frame) -> Motion {
+    let mut horizontal = 0;
+    let mut vertical = 0;
+    let mut verticalNext = true;
+    if frame.phase == "playing" {
+        if frame.serving == false {
+            horizontal = previous.horizontal;
+            vertical = previous.vertical;
+            verticalNext = previous.verticalNext;
+            if frame.x < previous.x { horizontal = -1; }
+            if frame.x > previous.x { horizontal = 1; }
+            if frame.y < previous.y { vertical = -1; }
+            if frame.y > previous.y { vertical = 1; }
+            if frame.x == game.sum(base: previous.x, delta: horizontal) {
+                if horizontal != 0 { verticalNext = frame.y == previous.y; }
+            }
+        }
+    }
+    return Motion(x: frame.x, y: frame.y, horizontal: horizontal, vertical: vertical,
+                  verticalNext: verticalNext);
+}
+
+pure ending fn half(distance: int32) -> int32 {
+    let mut remaining = distance;
+    let mut rows = 0;
+    let powers = [64, 32, 16, 8, 4, 2];
+    for power in powers {
+        rows = game.sum(base: rows, delta: rows);
+        if remaining >= power {
+            remaining = difference(left: remaining, right: power);
+            rows = game.sum(base: rows, delta: 1);
+        }
+    }
+    return rows;
+}
+
+pure ending fn difference(left: int32, right: int32) -> int32 {
+    match subtract(left: left, right: right) {
+        Ok(value) { return value; }
+        Err(overflow) { return left; }
+    }
+}
+
+example "the predicted landing accounts for a bounce off the bottom" {
+    input row: 17;
+    input direction: 1;
+    input distance: 10;
+    expect 16;
+}
+example "the ball can cross the court and bounce off both walls" {
+    input row: 5;
+    input direction: -1;
+    input distance: 86;
+    expect 0;
+}
+pure deterministic ending fn landing(row: int32, direction: int32, distance: int32) -> int32 {
+    let travel = half(distance);
+    let mut projected = game.sum(base: row, delta: travel);
+    if direction < 0 { projected = difference(left: row, right: travel); }
+    // Unfold the two walls into a single line, then fold it back into the 20 rows.
+    if projected < 0 { projected = difference(left: 0, right: projected); }
+    if projected > 38 { projected = difference(left: projected, right: 38); }
+    if projected > 19 { projected = difference(left: 38, right: projected); }
+    return projected;
+}
+
+pure ending fn steer(frame: wire.Frame, motion: Motion) -> int32 {
+    if frame.phase != "playing" { return 0; }
+    let mut paddle = frame.right.center;
+    let mut distance = difference(left: game.lastBallColumn(), right: motion.x);
+    let mut incoming = motion.horizontal > 0;
+    if frame.seat == 1 {
+        paddle = frame.left.center;
+        distance = game.sum(base: motion.x, delta: -4);
+        incoming = motion.horizontal < 0;
+    }
+    let mut target = 9;
+    if incoming {
+        if motion.verticalNext { distance = game.sum(base: distance, delta: 1); }
+        target = max(2, min(17, motion.y));
+        if motion.vertical != 0 {
+            target = max(2, min(17, landing(row: motion.y, direction: motion.vertical, distance: distance)));
+        }
+    }
+    // Hold position within one row of the target to avoid unnecessary movement.
+    if target < game.sum(base: paddle, delta: -1) { return -1; }
+    if target > game.sum(base: paddle, delta: 1) { return 1; }
+    return 0;
+}
+
+pure ending fn side(seat: int32) -> string {
+    if seat == 1 { return "Cyan"; }
+    return "Magenta";
+}
+
+pure ending fn resultLine(frame: wire.Frame) -> string {
+    let scores = concat(left: formatInt32(frame.left.score), right: concat(left: "–", right: formatInt32(frame.right.score)));
+    if frame.phase == "aborted" { return concat(left: "Match abandoned. Score: ", right: scores); }
+    return concat(left: "Match finished. Final score: ", right: scores);
+}
+
+fn runBot(client: http_client, terminal: console, workers: threads, id: string) -> result<unit, string> {
+    let mut path = "/join";
+    let mut step = 0;
+    let mut phase = "";
+    let mut moveDelay = 0;
+    let mut motion = Motion(x: game.centerColumn(), y: 9, horizontal: 0, vertical: 0, verticalNext: true);
+    loop {
+        match requestHttp(client, request: wire.request(path: path, id: id, step: step), timeout: 300) {
+            Err(problem) {
+                // The next request fetches a fresh frame before the bot moves again.
+                step = 0;
+            }
+            Ok(response) {
+                if response.status == 200 {
+                    match wire.decodeFrame(response.body) {
+                        Err(problem) { return Err(problem); }
+                        Ok(frame) {
+                            if frame.phase == "finished" { print(terminal, resultLine(frame)); return Ok(unit); }
+                            if frame.phase == "aborted" { print(terminal, resultLine(frame)); return Ok(unit); }
+                            if frame.phase != phase {
+                                if frame.phase == "waiting" {
+                                    print(terminal, concat(left: "Waiting for an opponent as ", right: side(frame.seat)));
+                                } else {
+                                    print(terminal, concat(left: "Playing as ", right: side(frame.seat)));
+                                }
+                                phase = frame.phase;
+                            }
+                            path = "/input";
+                            motion = observe(previous: motion, frame: frame);
+                            step = 0;
+                            if moveDelay == 0 {
+                                step = steer(frame, motion);
+                                moveDelay = 1;
+                            } else {
+                                moveDelay = game.sum(base: moveDelay, delta: -1);
+                            }
+                        }
+                    }
+                } else {
+                    if response.status == 409 {
+                        if phase != "full" {
+                            print(terminal, "Both seats are taken. Waiting for a new match.");
+                            phase = "full";
+                        }
+                    } else {
+                        if response.status == 404 {
+                            if path == "/input" {
+                                print(terminal, "The server released the bot's seat. Rejoining.");
+                                return Ok(unit);
+                            }
+                        }
+                        if response.status != 503 {
+                            return Err(concat(left: "Server rejected the request: ", right: response.body));
+                        }
+                    }
+                    step = 0;
+                }
+            }
+        }
+        sleep(workers, duration: 50);
+    }
+}
+
+fn main(client: http_client, terminal: console, workers: threads, source: random) -> unit {
+    print(terminal, "Pong bot connecting…");
+    loop {
+        match wire.playerId(source) {
+            Err(problem) { print(terminal, describeHostError(problem)); return unit; }
+            Ok(id) {
+                // The server retains the previous result under the old player ID.
+                match runBot(client, terminal, workers, id) {
+                    Ok(done) {}
+                    Err(problem) { print(terminal, problem); return unit; }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,153 @@
+export record Paddle { center: int32, score: int32 }
+export record Ball {
+    x: int32, y: int32, dx: int32, dy: int32, moveVertically: bool, progress: int32
+}
+export record Court { left: Paddle, right: Paddle, ball: Ball, serve: int32, elapsed: int32 }
+record Tempo { before: int32, rate: int32 }
+
+export pure deterministic ending fn sum(base: int32, delta: int32) -> int32 {
+    match base + delta {
+        Ok(value) { return value; }
+        Err(overflow) { return base; }
+    }
+}
+
+pure ending fn negate(value: int32) -> int32 {
+    match subtract(left: 0, right: value) {
+        Ok(negative) { return negative; }
+        Err(overflow) { return 0; }
+    }
+}
+
+export pure deterministic ending fn centerColumn() -> int32 { return 47; }
+
+export pure deterministic ending fn lastBallColumn() -> int32 { return 91; }
+
+pure ending fn kickoff(direction: int32, rise: int32) -> Ball {
+    return Ball(x: centerColumn(), y: 9, dx: direction, dy: rise, moveVertically: true, progress: 66);
+}
+
+export pure deterministic ending fn start() -> Court {
+    let paddle = Paddle(center: 9, score: 0);
+    return Court(left: paddle, right: paddle, ball: kickoff(direction: 1, rise: 1), serve: 24, elapsed: 0);
+}
+
+export pure deterministic ending fn move(court: Court, seat: int32, step: int32) -> Court {
+    let mut left = court.left;
+    let mut right = court.right;
+    if seat == 1 {
+        left = Paddle(center: max(2, min(17, sum(base: left.center, delta: step))), score: left.score);
+    } else {
+        right = Paddle(center: max(2, min(17, sum(base: right.center, delta: step))), score: right.score);
+    }
+    return Court(left: left, right: right, ball: court.ball, serve: court.serve, elapsed: court.elapsed);
+}
+
+export pure deterministic ending fn covers(paddle: Paddle, row: int32) -> bool {
+    if row < sum(base: paddle.center, delta: -2) { return false; }
+    return row <= sum(base: paddle.center, delta: 2);
+}
+
+pure ending fn deflect(paddle: Paddle, row: int32, previous: int32) -> int32 {
+    if row < paddle.center { return -1; }
+    if row > paddle.center { return 1; }
+    return previous;
+}
+
+example "the opening rate retains one movement per three ticks" {
+    input elapsed: 0;
+    expect 33;
+}
+example "the rate rises as the match progresses" {
+    input elapsed: 300;
+    expect 58;
+}
+example "after about one minute the ball can move on every tick" {
+    input elapsed: 1800;
+    expect 99;
+}
+pure deterministic ending fn speed(elapsed: int32) -> int32 {
+    // Quantized 33 + 16.5 * log2(1 + elapsed / 120), capped at one cell per tick.
+    // Rates are measured in 99ths of a column per tick.
+    let tempos = [
+        Tempo(before: 29, rate: 33), Tempo(before: 63, rate: 38), Tempo(before: 106, rate: 43),
+        Tempo(before: 159, rate: 48), Tempo(before: 223, rate: 53), Tempo(before: 304, rate: 58),
+        Tempo(before: 403, rate: 63), Tempo(before: 525, rate: 68), Tempo(before: 675, rate: 73),
+        Tempo(before: 861, rate: 78), Tempo(before: 1090, rate: 83), Tempo(before: 1373, rate: 88),
+        Tempo(before: 1722, rate: 93), Tempo(before: 1800, rate: 98)
+    ];
+    for tempo in tempos {
+        if elapsed < tempo.before { return tempo.rate; }
+    }
+    return 99;
+}
+
+example "fractional travel carries forward to the next tick" {
+    input court: Court(left: Paddle(center: 9, score: 0), right: Paddle(center: 9, score: 0),
+                       ball: Ball(x: 47, y: 9, dx: 1, dy: 1, moveVertically: true, progress: 33),
+                       serve: 0, elapsed: 0);
+    expect Court(left: Paddle(center: 9, score: 0), right: Paddle(center: 9, score: 0),
+                 ball: Ball(x: 47, y: 9, dx: 1, dy: 1, moveVertically: true, progress: 66),
+                 serve: 0, elapsed: 1);
+}
+example "a whole column triggers a diagonal step" {
+    input court: Court(left: Paddle(center: 9, score: 0), right: Paddle(center: 9, score: 0),
+                       ball: Ball(x: 47, y: 9, dx: 1, dy: 1, moveVertically: true, progress: 66),
+                       serve: 0, elapsed: 1);
+    expect Court(left: Paddle(center: 9, score: 0), right: Paddle(center: 9, score: 0),
+                 ball: Ball(x: 48, y: 10, dx: 1, dy: 1, moveVertically: false, progress: 0),
+                 serve: 0, elapsed: 2);
+}
+example "a point resets the serve while retaining the match time" {
+    input court: Court(left: Paddle(center: 9, score: 0), right: Paddle(center: 9, score: 0),
+                       ball: Ball(x: 90, y: 2, dx: 1, dy: 1, moveVertically: false, progress: 50),
+                       serve: 0, elapsed: 300);
+    expect Court(left: Paddle(center: 9, score: 1), right: Paddle(center: 9, score: 0),
+                 ball: Ball(x: 47, y: 9, dx: 1, dy: -1, moveVertically: true, progress: 66),
+                 serve: 18, elapsed: 301);
+}
+export pure deterministic ending fn tick(court: Court) -> Court {
+    if court.serve > 0 {
+        return Court(left: court.left, right: court.right, ball: court.ball,
+                     serve: sum(base: court.serve, delta: -1), elapsed: court.elapsed);
+    }
+    let elapsed = min(1800, sum(base: court.elapsed, delta: 1));
+    let previous = court.ball;
+    let progress = sum(base: previous.progress, delta: speed(elapsed));
+    if progress < 99 {
+        let paused = Ball(x: previous.x, y: previous.y, dx: previous.dx, dy: previous.dy,
+                          moveVertically: previous.moveVertically, progress: progress);
+        return Court(left: court.left, right: court.right, ball: paused, serve: 0, elapsed: elapsed);
+    }
+    let mut x = sum(base: previous.x, delta: previous.dx);
+    let mut y = previous.y;
+    // Move one row every other horizontal step to preserve the bounce angle.
+    if previous.moveVertically { y = sum(base: y, delta: previous.dy); }
+    let mut dx = previous.dx;
+    let mut dy = previous.dy;
+    if y < 0 { y = 1; dy = 1; }
+    if y > 19 { y = 18; dy = -1; }
+    if x <= 4 {
+        if covers(paddle: court.left, row: y) {
+            x = 4;
+            dx = 1;
+            dy = deflect(paddle: court.left, row: y, previous: dy);
+        } else {
+            let right = Paddle(center: court.right.center, score: sum(base: court.right.score, delta: 1));
+            return Court(left: court.left, right: right, ball: kickoff(direction: -1, rise: negate(dy)), serve: 18, elapsed: elapsed);
+        }
+    }
+    if x >= lastBallColumn() {
+        if covers(paddle: court.right, row: y) {
+            x = lastBallColumn();
+            dx = -1;
+            dy = deflect(paddle: court.right, row: y, previous: dy);
+        } else {
+            let left = Paddle(center: court.left.center, score: sum(base: court.left.score, delta: 1));
+            return Court(left: left, right: court.right, ball: kickoff(direction: 1, rise: negate(dy)), serve: 18, elapsed: elapsed);
+        }
+    }
+    let ball = Ball(x: x, y: y, dx: dx, dy: dy, moveVertically: previous.moveVertically == false,
+                    progress: sum(base: progress, delta: -99));
+    return Court(left: court.left, right: court.right, ball: ball, serve: 0, elapsed: elapsed);
+}

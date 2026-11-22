@@ -28,6 +28,7 @@ class Thread:
     cancellation_requested: bool = False
     unwinding: bool = False
     cleanup_depth: int = 0
+    resources: dict = field(default_factory=dict)
 
     @property
     def can_interrupt(self):
@@ -59,6 +60,7 @@ class Scheduler:
         self.timers = Timers()
         self.ready = deque()
         self.active = {}
+        self.external = {}
         self.current = None
         self.next_number = 1
 
@@ -94,6 +96,25 @@ class Scheduler:
         self.clear_wait(task)
         task.inbox = value
         self.ready.append(task)
+
+    def pause(self, duration):
+        self.park("sleep", deadline=self.clock() + duration / 1000)
+        yield
+
+    def wait_external(self, reason, probe, deadline, timeout, cancel=None):
+        value = probe()
+        if value is not None:
+            return value
+        task = self.current
+        self.external[task] = probe
+
+        def remove():
+            self.external.pop(task)
+            if cancel is not None:
+                cancel()
+
+        self.park(reason, remove=remove, deadline=deadline, timeout_value=timeout)
+        return (yield)
 
     def join(self, target, *, action="join"):
         if target.outcome is not None:
@@ -136,6 +157,9 @@ class Scheduler:
         return (yield from self.join(target, action=name))
 
     def finish(self, task, outcome):
+        for _, release in task.resources.values():
+            release()
+        task.resources.clear()
         task.outcome = outcome
         del self.active[task.number]
         for joiner in tuple(task.joiners):
@@ -175,10 +199,15 @@ class Scheduler:
         root = self.start(code)
         while self.active:
             self.expire_timers()
+            for task, probe in tuple(self.external.items()):
+                value = probe()
+                if value is not None:
+                    self.wake(task, value)
             if not self.ready:
                 deadline = self.timers.next_deadline()
                 if deadline is not None:
-                    self.idle(max(0, deadline - self.clock()))
+                    delay = max(0, deadline - self.clock())
+                    self.idle(min(delay, 0.002) if self.external else delay)
                     continue
                 reasons = ", ".join(f"{task}: {task.waiting_for}" for task in self.active.values())
                 raise RuntimeError(f"deadlock ({reasons})")

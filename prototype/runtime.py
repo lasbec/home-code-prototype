@@ -14,10 +14,11 @@ from time import monotonic
 from .channels import buffer as channels
 from .channels.api import OPERATIONS as CHANNEL_OPERATIONS
 from .checker import HOST_FUNCTIONS
+from .http_io import OPERATIONS as HTTP_OPERATIONS
 from .syntax import EXAMPLE_ERROR_MESSAGES, INTEGER_BOUNDS
 from .threads import signatures as threads
 from .threads.scheduler import Cancelled, Scheduler
-from .values import Failure, Result, Variant
+from .values import Failure, Record, Result, Variant
 
 try:
     import termios
@@ -29,12 +30,6 @@ except ImportError:
 @dataclass
 class Cell:
     value: object
-
-
-@dataclass(frozen=True)
-class Record:
-    name: str
-    fields: tuple
 
 
 @dataclass(frozen=True)
@@ -279,7 +274,7 @@ def parse_int(text):
 
 
 def host_error_kind(error):
-    tag = error.code if error.code in {"EndOfInput", "FileNotFound"} else "Other"
+    tag = error.code if error.code in {"EndOfInput", "FileNotFound", "Timeout"} else "Other"
     return Variant("HostErrorKind", tag)
 
 
@@ -329,6 +324,8 @@ class Interpreter:
         return scheduler.run(self.invoke(name, arguments, scheduler))
 
     def invoke(self, name, arguments, scheduler):
+        if name == "sleep":
+            return (yield from scheduler.pause(arguments[1]))
         if name in CHANNEL_OPERATIONS:
             return (yield from channels.invoke(name, arguments, scheduler))
         if name in threads.OPERATIONS:
@@ -336,6 +333,8 @@ class Interpreter:
         if name in HOST_FUNCTIONS and isinstance(arguments[0], MockCapability):
             capability = arguments[0]
             return self.call((capability.module, name), (capability.state, *arguments[1:]))
+        if name in HTTP_OPERATIONS:
+            return (yield from HTTP_OPERATIONS[name](arguments[0], scheduler, *arguments[1:]))
         if name in BUILTINS:
             return BUILTINS[name](*arguments)
         function = self.functions[name]

@@ -4,6 +4,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field, replace
 
 from .channels import signatures as channels
+from .http_signatures import HTTP_RECORDS, HTTP_FUNCTIONS, SLEEP
 from .syntax import (
     BOOL, CAPABILITIES, CONSOLE, EXAMPLE_ERROR_MESSAGES, FILESYSTEM, FLOAT, GENERIC_TYPES, GUARANTEES, HOST_ERROR,
     HOST_ERROR_KIND, INDEX_ERROR, INT, INTEGER_BOUNDS, OVERFLOW, PARSE_INT_ERROR, RANDOM, RANDOM_DRAW, SIMPLE_TYPES,
@@ -33,11 +34,13 @@ HOST_FUNCTIONS = {
                 result_type(INT, HOST_ERROR), commutative=("bound0", "bound1")),
     )
 }
+HOST_FUNCTIONS.update(HTTP_FUNCTIONS)
 HOST_ERROR_CONSTRUCTOR = builtin("HostError", (("kind", HOST_ERROR_KIND), ("message", STRING)),
                                  HOST_ERROR, GUARANTEES)
 BUILTIN_RECORDS = {
     RANDOM_DRAW: builtin(RANDOM_DRAW.name, (("value", INT), ("state", INT)), RANDOM_DRAW, GUARANTEES),
     UNICODE_ERROR: builtin(UNICODE_ERROR.name, (("index", UINT),), UNICODE_ERROR, GUARANTEES),
+    **HTTP_RECORDS,
 }
 CODE_POINTS = Type("list", (UINT,))
 PURE_FUNCTIONS = {
@@ -56,7 +59,8 @@ PURE_FUNCTIONS = {
 }
 GENERIC_FUNCTIONS = {"add", "subtract", "min", "max", "nonzero", "at", "prepend", "dropLast", "toUint32"}
 CONSTRUCTORS = {"Ok", "Err"}
-BUILTIN_NAMES = HOST_FUNCTIONS.keys() | PURE_FUNCTIONS.keys() | GENERIC_FUNCTIONS | CONSTRUCTORS | threads.OPERATIONS | channels.OPERATIONS.keys()
+BUILTIN_NAMES = (HOST_FUNCTIONS.keys() | PURE_FUNCTIONS.keys() | GENERIC_FUNCTIONS | CONSTRUCTORS
+                 | threads.OPERATIONS | channels.OPERATIONS.keys() | {SLEEP.name})
 LITERAL_VALUE_KINDS = {"value", "integer", "decimal", "list", "variant", "call"}
 
 
@@ -196,7 +200,7 @@ class Checker:
         self.enum_names = {kind.name: kind for kind in (HOST_ERROR_KIND, *channels.ENUMS)}
         self.records = BUILTIN_RECORDS.copy()
         self.enums = {
-            HOST_ERROR_KIND: {"EndOfInput": None, "FileNotFound": None, "Other": None},
+            HOST_ERROR_KIND: {"EndOfInput": None, "FileNotFound": None, "Timeout": None, "Other": None},
             **channels.ENUMS,
         }
         self.public_types = {
@@ -281,7 +285,10 @@ class Checker:
                     or signature != tuple((p.name, p.type, p.mutable, p.owning) for p in host.parameters[1:])
                     or function.output != host.output
                     or function.commutative_slots != host.commutative_slots):
-                remaining = [f"{p.name}: {p.type}" for p in host.parameters[1:]]
+                remaining = [
+                    f"{parameter.name}: {'own ' if parameter.owning else ''}{parameter.type}"
+                    for parameter in host.parameters[1:]
+                ]
                 arguments = ", ".join(["state: mut <state type>", *remaining])
                 commutative = f"commutative {' '.join(host.commutative)} " if host.commutative else ""
                 raise LanguageError(function.token,
@@ -960,6 +967,10 @@ class Checker:
             return self.prepend(node, flow, expected, deferred=deferred)
         signature = (self.functions.get(name) or self.imported_functions.get(name)
                      or PURE_FUNCTIONS.get(name))
+        if name == SLEEP.name:
+            if self.mock_header:
+                raise LanguageError(node.token, "mock files cannot use sleep")
+            signature = SLEEP
         if signature is None and name in HOST_FUNCTIONS:
             if self.mock_header:
                 raise LanguageError(node.token, f"mock files cannot call live host function '{name}'")

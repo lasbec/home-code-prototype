@@ -1,0 +1,130 @@
+import "./game.proto"
+import "./screen.proto"
+import "./wire.proto"
+
+record Keys { step: int32, quit: bool, replay: bool }
+enum Next { Quit, Replay }
+
+pure ending fn inputKeys(keys: list<string>) -> Keys {
+    let mut step = 0;
+    let mut replay = false;
+    for key in keys {
+        if key == "q" { return Keys(step: 0, quit: true, replay: false); }
+        if key == "Q" { return Keys(step: 0, quit: true, replay: false); }
+        if key == "r" { replay = true; }
+        if key == "R" { replay = true; }
+        if key == "w" { step = -1; }
+        if key == "W" { step = -1; }
+        if key == "s" { step = 1; }
+        if key == "S" { step = 1; }
+    }
+    return Keys(step: step, quit: false, replay: replay);
+}
+
+fn pace(workers: shared threads, pulses: Channel<unit>) -> unit {
+    loop {
+        try_send(pulses, unit);
+        sleep(workers, duration: 16);
+    }
+}
+
+fn restore(terminal: console) -> unit {
+    write(terminal, "\u001b[0m\u001b[K\n");
+    disableKeyInput(terminal);
+}
+
+fn session(client: http_client, terminal: console, pulses: Channel<unit>, id: string) -> result<Next, string> {
+    let mut path = "/join";
+    let mut finished = false;
+    let mut latest = wire.Frame(seat: 0, phase: "waiting", left: gameStart(), right: gameStart(),
+                                x: game.centerColumn(), y: 9, serving: true);
+    write(terminal, screen.lobby("Connecting to the server…"));
+    loop {
+        receive_blocking(pulses);
+        match readKeysFor(terminal, timeout: 0) {
+            Err(problem) { return Err(describeHostError(problem)); }
+            Ok(keys) {
+                let selected = inputKeys(keys);
+                if selected.quit { return Ok(Next::Quit); }
+                if finished {
+                    if selected.replay { return Ok(Next::Replay); }
+                } else {
+                    match requestHttp(client, request: wire.request(path: path, id: id, step: selected.step), timeout: 300) {
+                        Err(problem) {
+                            if path == "/join" {
+                                write(terminal, screen.lobby("Server unavailable · retrying…"));
+                            } else {
+                                write(terminal, screen.draw(latest, notice: "Connection interrupted · retrying…"));
+                            }
+                        }
+                        Ok(response) {
+                            if response.status == 200 {
+                                match wire.decodeFrame(response.body) {
+                                    Err(problem) { return Err(problem); }
+                                    Ok(frame) {
+                                        latest = frame;
+                                        path = "/input";
+                                        write(terminal, screen.draw(frame, notice: ""));
+                                        finished = wire.ended(frame);
+                                    }
+                                }
+                            } else {
+                                if response.status == 409 {
+                                    write(terminal, screen.lobby("Both seats are taken · waiting for a new match…"));
+                                } else {
+                                    if response.status == 404 { return Err("The server released your seat."); }
+                                    if response.status != 503 {
+                                        return Err(concat(left: "Server rejected the request: ", right: response.body));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pure ending fn gameStart() -> game.Paddle {
+    return game.Paddle(center: 9, score: 0);
+}
+
+fn play(client: http_client, terminal: console, workers: shared threads, queues: channels, source: random) -> result<unit, string> {
+    defer restore(terminal);
+    let pulses: Channel<unit> = create_channel(queues, Capacity::Bounded(1));
+    let ticker = thread pace(workers, pulses);
+    defer kill(ticker);
+    loop {
+        match wire.playerId(source) {
+            Err(problem) { return Err(describeHostError(problem)); }
+            Ok(id) {
+                match session(client, terminal, pulses, id) {
+                    Err(problem) { return Err(problem); }
+                    Ok(next) {
+                        match next {
+                            Quit { return Ok(unit); }
+                            Replay {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn main(client: http_client, terminal: console, workers: shared threads, queues: channels, source: random) -> unit {
+    match enableKeyInput(terminal) {
+        Err(problem) { print(terminal, describeHostError(problem)); }
+        Ok(enabled) {
+            if enabled {
+                match play(client, terminal, workers, queues, source) {
+                    Ok(done) {}
+                    Err(problem) { print(terminal, problem); }
+                }
+            } else {
+                print(terminal, "Pong requires an interactive terminal with key input.");
+            }
+        }
+    }
+}

@@ -1,0 +1,122 @@
+import "./game.proto"
+import "./wire.proto"
+
+record Gap { count: int32, text: string }
+
+pure ending fn spaces(count: int32) -> string {
+    let mut remaining = count;
+    let mut result = "";
+    let gaps = [Gap(count: 32, text: "                                "), Gap(count: 16, text: "                "),
+                Gap(count: 8, text: "        "), Gap(count: 4, text: "    "), Gap(count: 2, text: "  "),
+                Gap(count: 1, text: " ")];
+    for gap in gaps {
+        if remaining >= gap.count {
+            result = concat(left: result, right: gap.text);
+            remaining = game.sum(base: remaining, delta: negate(gap.count));
+        }
+    }
+    return result;
+}
+
+pure ending fn negate(value: int32) -> int32 {
+    match subtract(left: 0, right: value) {
+        Ok(negative) { return negative; }
+        Err(overflow) { return 0; }
+    }
+}
+
+pure ending fn ballInLane(column: int32, width: int32) -> string {
+    let after = game.sum(base: game.sum(base: width, delta: negate(column)), delta: -1);
+    return concat(left: spaces(column), right: concat(left: "\u001b[1;93m●\u001b[0m", right: spaces(after)));
+}
+
+pure ending fn lane(ball: int32) -> string {
+    let mut leftLane = "                                           ";
+    let mut rightLane = "                                            ";
+    let mut net = "\u001b[38;5;60m┊\u001b[0m";
+    if ball >= 4 {
+        let center = game.centerColumn();
+        if ball < center { leftLane = ballInLane(column: game.sum(base: ball, delta: -4), width: 43); }
+        if ball == center { net = "\u001b[1;93m●\u001b[0m"; }
+        if ball > center { rightLane = ballInLane(column: game.sum(base: ball, delta: -48), width: 44); }
+    }
+    return concat(left: leftLane, right: concat(left: net, right: rightLane));
+}
+
+pure ending fn row(middle: string, leftPaddle: string, rightPaddle: string) -> string {
+    let start = concat(left: "\u001b[38;5;67m│\u001b[0m  ", right: leftPaddle);
+    let end = concat(left: rightPaddle, right: "  \u001b[38;5;67m│\u001b[0m\n");
+    return concat(left: start, right: concat(left: middle, right: end));
+}
+
+pure ending fn court(frame: wire.Frame) -> string {
+    let field = lane(0);
+    let cyan = "\u001b[1;96m██\u001b[0m";
+    let magenta = "\u001b[1;95m██\u001b[0m";
+    let empty = row(middle: field, leftPaddle: "  ", rightPaddle: "  ");
+    let leftOnly = row(middle: field, leftPaddle: cyan, rightPaddle: "  ");
+    let rightOnly = row(middle: field, leftPaddle: "  ", rightPaddle: magenta);
+    let both = row(middle: field, leftPaddle: cyan, rightPaddle: magenta);
+    let leftTop = game.sum(base: frame.left.center, delta: -2);
+    let leftBottom = game.sum(base: frame.left.center, delta: 2);
+    let rightTop = game.sum(base: frame.right.center, delta: -2);
+    let rightBottom = game.sum(base: frame.right.center, delta: 2);
+    let mut court = "";
+    let rows = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19];
+    for index in rows {
+        let left = index == max(leftTop, min(leftBottom, index));
+        let right = index == max(rightTop, min(rightBottom, index));
+        let mut line = empty;
+        if index == frame.y {
+            let mut leftPaddle = "  ";
+            let mut rightPaddle = "  ";
+            if left { leftPaddle = cyan; }
+            if right { rightPaddle = magenta; }
+            line = row(middle: lane(frame.x), leftPaddle: leftPaddle, rightPaddle: rightPaddle);
+        } else {
+            if left {
+                line = leftOnly;
+                if right { line = both; }
+            } else {
+                if right { line = rightOnly; }
+            }
+        }
+        court = concat(left: court, right: line);
+    }
+    return court;
+}
+
+pure ending fn status(frame: wire.Frame) -> string {
+    if frame.phase == "waiting" { return "Waiting for player 2"; }
+    if frame.phase == "aborted" { return "Match abandoned · a player disconnected"; }
+    if frame.phase == "finished" {
+        if frame.left.score == 5 { return "Game over · Cyan wins"; }
+        return "Game over · Magenta wins";
+    }
+    if frame.serving { return "Get ready · serve coming"; }
+    return "First to five";
+}
+
+export pure ending fn draw(frame: wire.Frame, notice: string) -> string {
+    let leftScore = concat(left: "   \u001b[1;96mCYAN ", right: formatInt32(frame.left.score));
+    let rightScore = concat(left: "   \u001b[1;95mMAGENTA ", right: formatInt32(frame.right.score));
+    let mut color = "\u001b[96mCyan";
+    if frame.seat == 2 { color = "\u001b[95mMagenta"; }
+    let seat = concat(left: "\u001b[0m   You: ", right: concat(left: color, right: "\u001b[0m"));
+    let score = concat(left: leftScore, right: concat(left: rightScore, right: seat));
+    let mut screen = concat(left: "\u001b[H  \u001b[1;97mP O N G\u001b[0m", right: score);
+    screen = concat(left: screen, right: "\u001b[K\n\u001b[38;5;67m┌───────────────────────────────────────────────┬────────────────────────────────────────────────┐\u001b[0m\n");
+    screen = concat(left: screen, right: court(frame));
+    screen = concat(left: screen, right: "\u001b[38;5;67m└───────────────────────────────────────────────┴────────────────────────────────────────────────┘\u001b[0m\n");
+    let mut message = status(frame);
+    if notice != "" { message = notice; }
+    let mut controls = "  \u001b[1mW/S\u001b[0m Move   \u001b[1mQ\u001b[0m Quit   │   ";
+    if wire.ended(frame) { controls = "  \u001b[1mR\u001b[0m Play again   \u001b[1mQ\u001b[0m Quit   │   "; }
+    let footer = concat(left: controls, right: message);
+    return concat(left: screen, right: concat(left: footer, right: "\u001b[K"));
+}
+
+export pure ending fn lobby(message: string) -> string {
+    let title = "\u001b[H\u001b[J\n  \u001b[1;96mP O N G\u001b[0m\n\n  ";
+    return concat(left: title, right: concat(left: message, right: "\n\n  \u001b[1mQ\u001b[0m Quit"));
+}

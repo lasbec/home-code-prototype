@@ -1,0 +1,173 @@
+import "./game.proto"
+import "./wire.proto"
+
+record Player { id: string, remaining: int32 }
+record Match { left: Player, right: Player, court: game.Court }
+record Finished { matchState: Match, reason: string, remaining: int32 }
+record State { active: Match, recentlyFinished: list<Finished> }
+record Input { command: wire.Command, joining: bool }
+record Update { state: State, response: HttpResponse }
+enum Event { Tick, Request(Input) }
+
+pure ending fn emptyMatch() -> Match {
+    let nobody = Player(id: "", remaining: 0);
+    return Match(left: nobody, right: nobody, court: game.start());
+}
+
+pure ending fn renewed(id: string) -> Player {
+    // 152 updates at 33 ms gives players just over five seconds.
+    return Player(id: id, remaining: 152);
+}
+
+pure ending fn age(player: Player) -> Player {
+    return Player(id: player.id, remaining: max(0, game.sum(base: player.remaining, delta: -1)));
+}
+
+pure ending fn phase(round: Match) -> string {
+    if round.right.id == "" { return "waiting"; }
+    return "playing";
+}
+
+pure ending fn advance(state: State) -> State {
+    let mut remained: list<Finished> = [];
+    let history = state.recentlyFinished;
+    for entry in history {
+        if entry.remaining > 1 {
+            remained = prepend(Finished(matchState: entry.matchState, reason: entry.reason,
+                                        remaining: game.sum(base: entry.remaining, delta: -1)), remained);
+        }
+    }
+
+    let round = state.active;
+    let left = age(round.left);
+    let right = age(round.right);
+    let mut court = round.court;
+    let mut reason = "";
+    if right.id == "" {
+        if left.remaining == 0 { return State(active: emptyMatch(), recentlyFinished: remained); }
+    } else {
+        if left.remaining == 0 { reason = "aborted"; }
+        if right.remaining == 0 { reason = "aborted"; }
+        if reason == "" {
+            court = game.tick(court);
+            if court.left.score == 5 { reason = "finished"; }
+            if court.right.score == 5 { reason = "finished"; }
+        }
+    }
+    let active = Match(left: left, right: right, court: court);
+    if reason == "" { return State(active: active, recentlyFinished: remained); }
+    let final = Finished(matchState: active, reason: reason, remaining: 152);
+    return State(active: emptyMatch(), recentlyFinished: prepend(final, remained));
+}
+
+pure ending fn handle(state: State, input: Input) -> Update {
+    let id = input.command.id;
+    let history = state.recentlyFinished;
+    for final in history {
+        if id == final.matchState.left.id {
+            return Update(state: state, response: wire.frameResponse(seat: 1, phase: final.reason, court: final.matchState.court));
+        }
+        if id == final.matchState.right.id {
+            return Update(state: state, response: wire.frameResponse(seat: 2, phase: final.reason, court: final.matchState.court));
+        }
+    }
+
+    let round = state.active;
+    let mut left = round.left;
+    let mut right = round.right;
+    let mut seat = 0;
+    if id == left.id {
+        seat = 1;
+    } else {
+        if id == right.id {
+            seat = 2;
+        } else {
+            if input.joining == false {
+                return Update(state: state, response: wire.message(status: 404, explanation: "Player has no active seat"));
+            }
+            if left.id == "" {
+                seat = 1;
+            } else {
+                if right.id == "" { seat = 2; }
+            }
+        }
+    }
+    if seat == 0 {
+        return Update(state: state, response: wire.message(status: 409, explanation: "Both seats are taken"));
+    }
+    if seat == 1 { left = renewed(id); }
+    if seat == 2 { right = renewed(id); }
+    let court = game.move(court: round.court, seat: seat, step: input.command.step);
+    let active = Match(left: left, right: right, court: court);
+    return Update(state: State(active: active, recentlyFinished: history),
+                  response: wire.frameResponse(seat: seat, phase: phase(active), court: court));
+}
+
+fn play(events: Channel<Event>, answers: Channel<HttpResponse>) -> unit {
+    let mut state = State(active: emptyMatch(), recentlyFinished: []);
+    loop {
+        match receive_blocking(events) {
+            Tick { state = advance(state); }
+            Request(input) {
+                let updated = handle(state, input);
+                state = updated.state;
+                send_blocking(answers, updated.response);
+            }
+        }
+    }
+}
+
+fn pace(workers: shared threads, events: Channel<Event>) -> unit {
+    loop {
+        sleep(workers, duration: 33);
+        send_blocking(events, Event::Tick);
+    }
+}
+
+fn dispatch(request: HttpRequest, events: Channel<Event>, answers: Channel<HttpResponse>) -> HttpResponse {
+    let mut joining = false;
+    if request.path == "/join" {
+        joining = true;
+    } else {
+        if request.path != "/input" { return wire.message(status: 404, explanation: "Unknown endpoint"); }
+    }
+    if request.method != "POST" { return wire.message(status: 405, explanation: "Use POST"); }
+    // Pong messages are tiny. Keep arbitrarily long JSON away from the game thread.
+    let mut size = 0;
+    let points = codePoints(request.body);
+    for point in points {
+        size = game.sum(base: size, delta: 1);
+        if size > 512 { return wire.message(status: 413, explanation: "Pong message too large"); }
+    }
+    match wire.decodeCommand(body: request.body, joining: joining) {
+        Ok(command) {
+            send_blocking(events, Event::Request(Input(command: command, joining: joining)));
+            return receive_blocking(answers);
+        }
+        Err(explanation) { return wire.message(status: 400, explanation: explanation); }
+    }
+}
+
+fn main(server: http_server, workers: shared threads, queues: channels, terminal: console) -> unit {
+    let events: Channel<Event> = create_channel(queues, Capacity::Bounded(8));
+    let answers: Channel<HttpResponse> = create_channel(queues, Capacity::Bounded(1));
+    let simulation = thread play(events, answers);
+    let ticker = thread pace(workers, events);
+    print(terminal, "Pong server ready. Waiting for two players.");
+    loop {
+        match acceptHttp(server, timeout: 250) {
+            Ok(incoming) {
+                let response = dispatch(request: incoming.request, events: events, answers: answers);
+                respondHttp(server, incoming, response, timeout: 250);
+            }
+            Err(problem) {
+                if hostErrorKind(problem) != HostErrorKind::Timeout {
+                    print(terminal, describeHostError(problem));
+                    kill(ticker);
+                    kill(simulation);
+                    return unit;
+                }
+            }
+        }
+    }
+}

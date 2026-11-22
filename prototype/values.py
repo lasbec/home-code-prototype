@@ -4,6 +4,12 @@ from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
+class Record:
+    name: str
+    fields: tuple
+
+
+@dataclass(frozen=True)
 class Result:
     tag: str
     value: object
