@@ -1,0 +1,930 @@
+// JSON numbers retain their source spelling. Object fields retain their order.
+export enum JsonValue {
+    Null, Bool(bool), String(string), Number(string), Array(list<JsonValue>), Object(list<JsonMember>)
+}
+export record JsonMember { key: string, value: JsonValue }
+
+export enum JsonPathSegment { Key(string), Index(uint32) }
+
+export enum JsonErrorKind {
+    ExpectedValue, ExpectedKey, ExpectedColon, ExpectedSeparator, TrailingContent,
+    UnexpectedEnd, InvalidLiteral, InvalidNumber, InvalidString, InvalidEscape,
+    InvalidUnicode, DuplicateKey, DepthLimitExceeded, InputTooLong
+}
+// End-of-input errors use the offset immediately after the last code point.
+export record JsonError { kind: JsonErrorKind, offset: int32 }
+
+export enum JsonAccessErrorKind { MissingKey, AmbiguousKey, IndexOutOfBounds, WrongValueKind }
+export record JsonAccessError { kind: JsonAccessErrorKind, segment: uint32 }
+
+export enum JsonSerializeErrorKind { InvalidNumber, InvalidUnicode, DuplicateKey, DepthLimitExceeded }
+export record JsonSerializeError { kind: JsonSerializeErrorKind, path: list<JsonPathSegment> }
+
+pure ending fn depthLimit() -> uint32 { return 128; }
+pure ending fn maxOffset() -> int32 { return 2147483647; }
+
+pure ending fn nextOffset(offset: int32) -> int32 {
+    match offset + 1 {
+        Ok(next) { return next; }
+        Err(overflow) { return offset; }
+    }
+}
+
+pure ending fn nextIndex(index: uint32) -> uint32 {
+    match index + 1 {
+        Ok(next) { return next; }
+        Err(overflow) { return index; }
+    }
+}
+
+pure ending fn previousDepth(depth: uint32) -> uint32 {
+    match subtract(left: depth, right: 1) {
+        Ok(previous) { return previous; }
+        Err(overflow) { return 0; }
+    }
+}
+
+// The sentinel is outside the Unicode code point range.
+pure ending fn endOfText() -> uint32 { return 1114112; }
+
+pure ending fn peek(points: list<uint32>, offset: int32) -> uint32 {
+    match at(points, offset) {
+        Ok(point) { return point; }
+        Err(outside) { return endOfText(); }
+    }
+}
+
+pure ending fn isWhitespace(point: uint32) -> bool {
+    if point == 32 { return true; }
+    if point == 9 { return true; }
+    if point == 10 { return true; }
+    return point == 13;
+}
+
+pure ending fn isDigit(point: uint32) -> bool {
+    if point < 48 { return false; }
+    return point <= 57;
+}
+
+pure ending fn isSurrogate(point: uint32) -> bool {
+    if point < 55296 { return false; }
+    return point <= 57343;
+}
+
+pure ending fn pointsToText(reversed: list<uint32>) -> result<string, UnicodeError> {
+    let mut points: list<uint32> = [];
+    for point in reversed { points = prepend(point, points); }
+    return stringFromCodePoints(points);
+}
+
+record ScannedText { text: string, next: int32 }
+record ScannedPoint { point: uint32, next: int32 }
+
+pure ending fn scanLiteral(points: list<uint32>, start: int32, literal: string) -> result<int32, JsonError> {
+    let expected = codePoints(literal);
+    let mut cursor = start;
+    for letter in expected {
+        let point = peek(points, cursor);
+        if point == endOfText() { return Err(JsonError(kind: JsonErrorKind::UnexpectedEnd, offset: cursor)); }
+        if point != letter { return Err(JsonError(kind: JsonErrorKind::InvalidLiteral, offset: cursor)); }
+        cursor = nextOffset(cursor);
+    }
+    return Ok(cursor);
+}
+
+enum NumberState { Start, IntegerStart, Zero, Integer, FractionStart, Fraction, ExponentStart, ExponentSign, Exponent }
+enum NumberStep { Take(NumberState), Finish, Invalid }
+
+pure ending fn integerDigit(point: uint32) -> NumberStep {
+    if point == 48 { return NumberStep::Take(NumberState::Zero); }
+    if isDigit(point) { return NumberStep::Take(NumberState::Integer); }
+    return NumberStep::Invalid;
+}
+
+pure ending fn afterInteger(point: uint32) -> NumberStep {
+    if point == 46 { return NumberStep::Take(NumberState::FractionStart); }
+    if point == 69 { return NumberStep::Take(NumberState::ExponentStart); }
+    if point == 101 { return NumberStep::Take(NumberState::ExponentStart); }
+    return NumberStep::Finish;
+}
+
+pure ending fn numberStep(state: NumberState, point: uint32) -> NumberStep {
+    match state {
+        Start {
+            if point == 45 { return NumberStep::Take(NumberState::IntegerStart); }
+            return integerDigit(point);
+        }
+        IntegerStart { return integerDigit(point); }
+        Zero {
+            if isDigit(point) { return NumberStep::Invalid; }
+            return afterInteger(point);
+        }
+        Integer {
+            if isDigit(point) { return NumberStep::Take(NumberState::Integer); }
+            return afterInteger(point);
+        }
+        FractionStart {
+            if isDigit(point) { return NumberStep::Take(NumberState::Fraction); }
+            return NumberStep::Invalid;
+        }
+        Fraction {
+            if isDigit(point) { return NumberStep::Take(NumberState::Fraction); }
+            if point == 69 { return NumberStep::Take(NumberState::ExponentStart); }
+            if point == 101 { return NumberStep::Take(NumberState::ExponentStart); }
+            return NumberStep::Finish;
+        }
+        ExponentStart {
+            if point == 43 { return NumberStep::Take(NumberState::ExponentSign); }
+            if point == 45 { return NumberStep::Take(NumberState::ExponentSign); }
+            if isDigit(point) { return NumberStep::Take(NumberState::Exponent); }
+            return NumberStep::Invalid;
+        }
+        ExponentSign {
+            if isDigit(point) { return NumberStep::Take(NumberState::Exponent); }
+            return NumberStep::Invalid;
+        }
+        Exponent {
+            if isDigit(point) { return NumberStep::Take(NumberState::Exponent); }
+            return NumberStep::Finish;
+        }
+    }
+}
+
+pure ending fn finishNumber(reversed: list<uint32>, cursor: int32) -> result<ScannedText, JsonError> {
+    match pointsToText(reversed) {
+        Ok(text) { return Ok(ScannedText(text: text, next: cursor)); }
+        Err(error) { return Err(JsonError(kind: JsonErrorKind::InvalidNumber, offset: cursor)); }
+    }
+}
+
+pure ending fn scanNumber(points: list<uint32>, start: int32) -> result<ScannedText, JsonError> {
+    let mut cursor = start;
+    let mut state = NumberState::Start;
+    let mut reversed: list<uint32> = [];
+    // Each step consumes one code point or finishes the token.
+    for budget in points {
+        let point = peek(points, cursor);
+        match numberStep(state, point) {
+            Take(next) {
+                reversed = prepend(point, reversed);
+                state = next;
+                cursor = nextOffset(cursor);
+            }
+            Finish { return finishNumber(reversed, cursor); }
+            Invalid { return Err(JsonError(kind: JsonErrorKind::InvalidNumber, offset: cursor)); }
+        }
+    }
+    // When the number fills the whole input, test whether its final state can end.
+    match numberStep(state, endOfText()) {
+        Finish { return finishNumber(reversed, cursor); }
+        Take(next) { return Err(JsonError(kind: JsonErrorKind::InvalidNumber, offset: cursor)); }
+        Invalid { return Err(JsonError(kind: JsonErrorKind::InvalidNumber, offset: cursor)); }
+    }
+}
+
+pure ending fn digitOffset(point: uint32, zero: uint32) -> uint32 {
+    match subtract(left: point, right: zero) {
+        Ok(digit) { return digit; }
+        Err(overflow) { return 16; }
+    }
+}
+
+pure ending fn hexDigit(point: uint32) -> uint32 {
+    if isDigit(point) { return digitOffset(point: point, zero: 48); }
+    if point >= 65 {
+        if point <= 70 { return digitOffset(point: point, zero: 55); }
+    }
+    if point >= 97 {
+        if point <= 102 { return digitOffset(point: point, zero: 87); }
+    }
+    return 16;
+}
+
+// The callers keep base * width + tail within the Unicode range.
+pure ending fn combine(base: uint32, width: uint32, tail: uint32) -> uint32 {
+    match base * width {
+        Ok(product) {
+            match product + tail {
+                Ok(value) { return value; }
+                Err(overflow) { return endOfText(); }
+            }
+        }
+        Err(overflow) { return endOfText(); }
+    }
+}
+
+pure ending fn scanHex(points: list<uint32>, start: int32) -> result<ScannedPoint, JsonError> {
+    let places = [0, 0, 0, 0];
+    let mut cursor = start;
+    let mut value: uint32 = 0;
+    for place in places {
+        let digit = hexDigit(peek(points, cursor));
+        if digit == 16 { return Err(JsonError(kind: JsonErrorKind::InvalidEscape, offset: cursor)); }
+        value = combine(base: value, width: 16, tail: digit);
+        cursor = nextOffset(cursor);
+    }
+    return Ok(ScannedPoint(point: value, next: cursor));
+}
+
+pure ending fn surrogatePoint(high: uint32, low: uint32) -> uint32 {
+    match subtract(left: high, right: 55296) {
+        Ok(first) {
+            match subtract(left: low, right: 56320) {
+                Ok(second) { return combine(base: first, width: 1024, tail: combine(base: 65536, width: 1, tail: second)); }
+                Err(overflow) { return endOfText(); }
+            }
+        }
+        Err(overflow) { return endOfText(); }
+    }
+}
+
+pure ending fn scanUnicodeEscape(points: list<uint32>, start: int32) -> result<ScannedPoint, JsonError> {
+    match scanHex(points, nextOffset(start)) {
+        Err(error) { return Err(error); }
+        Ok(first) {
+            if isSurrogate(first.point) == false { return Ok(first); }
+            if first.point >= 56320 {
+                return Err(JsonError(kind: JsonErrorKind::InvalidUnicode, offset: start));
+            }
+            if peek(points, first.next) != 92 {
+                return Err(JsonError(kind: JsonErrorKind::InvalidUnicode, offset: start));
+            }
+            let marker = nextOffset(first.next);
+            if peek(points, marker) != 117 {
+                return Err(JsonError(kind: JsonErrorKind::InvalidUnicode, offset: start));
+            }
+            match scanHex(points, nextOffset(marker)) {
+                Err(error) { return Err(error); }
+                Ok(second) {
+                    if second.point < 56320 {
+                        return Err(JsonError(kind: JsonErrorKind::InvalidUnicode, offset: marker));
+                    }
+                    if second.point > 57343 {
+                        return Err(JsonError(kind: JsonErrorKind::InvalidUnicode, offset: marker));
+                    }
+                    return Ok(ScannedPoint(point: surrogatePoint(high: first.point, low: second.point), next: second.next));
+                }
+            }
+        }
+    }
+}
+
+pure ending fn scanEscape(points: list<uint32>, cursor: int32) -> result<ScannedPoint, JsonError> {
+    let escape = peek(points, cursor);
+    if escape == 117 { return scanUnicodeEscape(points, cursor); }
+    let next = nextOffset(cursor);
+    if escape == 34 { return Ok(ScannedPoint(point: 34, next: next)); }
+    if escape == 92 { return Ok(ScannedPoint(point: 92, next: next)); }
+    if escape == 47 { return Ok(ScannedPoint(point: 47, next: next)); }
+    if escape == 98 { return Ok(ScannedPoint(point: 8, next: next)); }
+    if escape == 102 { return Ok(ScannedPoint(point: 12, next: next)); }
+    if escape == 110 { return Ok(ScannedPoint(point: 10, next: next)); }
+    if escape == 114 { return Ok(ScannedPoint(point: 13, next: next)); }
+    if escape == 116 { return Ok(ScannedPoint(point: 9, next: next)); }
+    return Err(JsonError(kind: JsonErrorKind::InvalidEscape, offset: cursor));
+}
+
+pure ending fn scanString(points: list<uint32>, start: int32) -> result<ScannedText, JsonError> {
+    let mut cursor = nextOffset(start);
+    let mut reversed: list<uint32> = [];
+    for budget in points {
+        let point = peek(points, cursor);
+        if point == endOfText() { return Err(JsonError(kind: JsonErrorKind::UnexpectedEnd, offset: cursor)); }
+        if point == 34 {
+            match pointsToText(reversed) {
+                Ok(text) { return Ok(ScannedText(text: text, next: nextOffset(cursor))); }
+                Err(error) { return Err(JsonError(kind: JsonErrorKind::InvalidUnicode, offset: cursor)); }
+            }
+        }
+        if point < 32 { return Err(JsonError(kind: JsonErrorKind::InvalidString, offset: cursor)); }
+        if isSurrogate(point) { return Err(JsonError(kind: JsonErrorKind::InvalidUnicode, offset: cursor)); }
+        if point == 92 {
+            match scanEscape(points, nextOffset(cursor)) {
+                Ok(decoded) {
+                    reversed = prepend(decoded.point, reversed);
+                    cursor = decoded.next;
+                }
+                Err(error) { return Err(error); }
+            }
+        } else {
+            reversed = prepend(point, reversed);
+            cursor = nextOffset(cursor);
+        }
+    }
+    return Err(JsonError(kind: JsonErrorKind::UnexpectedEnd, offset: cursor));
+}
+
+enum Phase { Value, ArrayStart, ObjectStart, Key, Colon, Separator, End }
+enum Container { Array(list<JsonValue>), Object(ObjectContents) }
+record ObjectContents { key: string, reversed: list<JsonMember> }
+enum Stack { Root, Open(Frame), Done(JsonValue) }
+record Frame { container: Container, parent: Stack }
+record ParseState { stack: Stack, phase: Phase, depth: uint32, offset: int32 }
+
+pure ending fn advanceParse(state: ParseState, phase: Phase) -> ParseState {
+    return ParseState(stack: state.stack, phase: phase, depth: state.depth, offset: nextOffset(state.offset));
+}
+
+pure ending fn openContainer(state: ParseState, container: Container, phase: Phase) -> result<ParseState, JsonError> {
+    if state.depth == depthLimit() {
+        return Err(JsonError(kind: JsonErrorKind::DepthLimitExceeded, offset: state.offset));
+    }
+    let frame = Frame(container: container, parent: state.stack);
+    return Ok(ParseState(stack: Stack::Open(frame), phase: phase, depth: nextIndex(state.depth),
+                         offset: nextOffset(state.offset)));
+}
+
+pure ending fn acceptValue(value: JsonValue, stack: Stack, depth: uint32, offset: int32) -> result<ParseState, JsonError> {
+    match stack {
+        Root { return Ok(ParseState(stack: Stack::Done(value), phase: Phase::End, depth: depth, offset: offset)); }
+        Done(previous) { return Err(JsonError(kind: JsonErrorKind::TrailingContent, offset: offset)); }
+        Open(frame) {
+            let mut container = frame.container;
+            match frame.container {
+                Array(items) { container = Container::Array(prepend(value, items)); }
+                Object(contents) {
+                    let field = JsonMember(key: contents.key, value: value);
+                    container = Container::Object(ObjectContents(key: "", reversed: prepend(field, contents.reversed)));
+                }
+            }
+            return Ok(ParseState(stack: Stack::Open(Frame(container: container, parent: frame.parent)),
+                                 phase: Phase::Separator, depth: depth, offset: offset));
+        }
+    }
+}
+
+pure ending fn closeContainer(state: ParseState) -> result<ParseState, JsonError> {
+    match state.stack {
+        Root { return Err(JsonError(kind: JsonErrorKind::ExpectedValue, offset: state.offset)); }
+        Done(previous) { return Err(JsonError(kind: JsonErrorKind::TrailingContent, offset: state.offset)); }
+        Open(frame) {
+            let offset = nextOffset(state.offset);
+            let depth = previousDepth(state.depth);
+            match frame.container {
+                Array(reversed) {
+                    let mut values: list<JsonValue> = [];
+                    for value in reversed { values = prepend(value, values); }
+                    return acceptValue(value: JsonValue::Array(values), stack: frame.parent, depth: depth, offset: offset);
+                }
+                Object(contents) {
+                    let reversed = contents.reversed;
+                    let mut members: list<JsonMember> = [];
+                    for field in reversed { members = prepend(field, members); }
+                    return acceptValue(value: JsonValue::Object(members), stack: frame.parent, depth: depth, offset: offset);
+                }
+            }
+        }
+    }
+}
+
+pure ending fn memberKeyExists(members: list<JsonMember>, key: string) -> bool {
+    for field in members {
+        if field.key == key { return true; }
+    }
+    return false;
+}
+
+pure ending fn readKey(points: list<uint32>, state: ParseState, point: uint32) -> result<ParseState, JsonError> {
+    if point != 34 { return Err(JsonError(kind: JsonErrorKind::ExpectedKey, offset: state.offset)); }
+    match state.stack {
+        Root { return Err(JsonError(kind: JsonErrorKind::ExpectedKey, offset: state.offset)); }
+        Done(previous) { return Err(JsonError(kind: JsonErrorKind::TrailingContent, offset: state.offset)); }
+        Open(frame) {
+            match frame.container {
+                Array(items) { return Err(JsonError(kind: JsonErrorKind::ExpectedKey, offset: state.offset)); }
+                Object(contents) {
+                    match scanString(points, state.offset) {
+                        Err(error) { return Err(error); }
+                        Ok(key) {
+                            if memberKeyExists(contents.reversed, key.text) {
+                                return Err(JsonError(kind: JsonErrorKind::DuplicateKey, offset: state.offset));
+                            }
+                            let updated = ObjectContents(key: key.text, reversed: contents.reversed);
+                            let stack = Stack::Open(Frame(container: Container::Object(updated), parent: frame.parent));
+                            return Ok(ParseState(stack: stack, phase: Phase::Colon, depth: state.depth, offset: key.next));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pure ending fn readLiteralValue(points: list<uint32>, state: ParseState, spelling: string, value: JsonValue)
+        -> result<ParseState, JsonError> {
+    match scanLiteral(points, state.offset, spelling) {
+        Ok(next) { return acceptValue(value: value, stack: state.stack, depth: state.depth, offset: next); }
+        Err(error) { return Err(error); }
+    }
+}
+
+pure ending fn readNumberValue(points: list<uint32>, state: ParseState) -> result<ParseState, JsonError> {
+    match scanNumber(points, state.offset) {
+        Ok(number) {
+            return acceptValue(value: JsonValue::Number(number.text), stack: state.stack, depth: state.depth,
+                               offset: number.next);
+        }
+        Err(error) { return Err(error); }
+    }
+}
+
+pure ending fn readValue(points: list<uint32>, state: ParseState, point: uint32) -> result<ParseState, JsonError> {
+    if point == 91 { return openContainer(state, Container::Array([]), Phase::ArrayStart); }
+    if point == 123 {
+        let empty = ObjectContents(key: "", reversed: []);
+        return openContainer(state, Container::Object(empty), Phase::ObjectStart);
+    }
+    if point == 110 { return readLiteralValue(points, state, "null", JsonValue::Null); }
+    if point == 116 { return readLiteralValue(points, state, "true", JsonValue::Bool(true)); }
+    if point == 102 { return readLiteralValue(points, state, "false", JsonValue::Bool(false)); }
+    if point == 34 {
+        match scanString(points, state.offset) {
+            Ok(text) {
+                return acceptValue(value: JsonValue::String(text.text), stack: state.stack, depth: state.depth,
+                                   offset: text.next);
+            }
+            Err(error) { return Err(error); }
+        }
+    }
+    if point == 45 { return readNumberValue(points, state); }
+    if isDigit(point) { return readNumberValue(points, state); }
+    return Err(JsonError(kind: JsonErrorKind::ExpectedValue, offset: state.offset));
+}
+
+pure ending fn readSeparator(state: ParseState, point: uint32) -> result<ParseState, JsonError> {
+    match state.stack {
+        Root { return Err(JsonError(kind: JsonErrorKind::ExpectedSeparator, offset: state.offset)); }
+        Done(previous) { return Err(JsonError(kind: JsonErrorKind::TrailingContent, offset: state.offset)); }
+        Open(frame) {
+            match frame.container {
+                Array(items) {
+                    if point == 93 { return closeContainer(state); }
+                    if point == 44 { return Ok(advanceParse(state, Phase::Value)); }
+                }
+                Object(contents) {
+                    if point == 125 { return closeContainer(state); }
+                    if point == 44 { return Ok(advanceParse(state, Phase::Key)); }
+                }
+            }
+        }
+    }
+    return Err(JsonError(kind: JsonErrorKind::ExpectedSeparator, offset: state.offset));
+}
+
+pure ending fn parseStep(points: list<uint32>, state: ParseState, point: uint32) -> result<ParseState, JsonError> {
+    if isWhitespace(point) { return Ok(advanceParse(state, state.phase)); }
+    match state.phase {
+        Value { return readValue(points, state, point); }
+        ArrayStart {
+            if point == 93 { return closeContainer(state); }
+            return readValue(points, state, point);
+        }
+        ObjectStart {
+            if point == 125 { return closeContainer(state); }
+            return readKey(points, state, point);
+        }
+        Key { return readKey(points, state, point); }
+        Colon {
+            if point == 58 { return Ok(advanceParse(state, Phase::Value)); }
+            return Err(JsonError(kind: JsonErrorKind::ExpectedColon, offset: state.offset));
+        }
+        Separator { return readSeparator(state, point); }
+        End { return Err(JsonError(kind: JsonErrorKind::TrailingContent, offset: state.offset)); }
+    }
+}
+
+pure ending fn finishParse(state: ParseState) -> result<JsonValue, JsonError> {
+    match state.stack {
+        Done(value) { return Ok(value); }
+        Root { return Err(JsonError(kind: JsonErrorKind::UnexpectedEnd, offset: state.offset)); }
+        Open(frame) { return Err(JsonError(kind: JsonErrorKind::UnexpectedEnd, offset: state.offset)); }
+    }
+}
+
+example "parse nested values and preserve exact numbers and field order" {
+    input text: " { \"number\":1e400,\"items\":[null,false,9007199254740993,-0.25E+02] }\r\n";
+    expect Ok(JsonValue::Object([
+        JsonMember(key: "number", value: JsonValue::Number("1e400")),
+        JsonMember(key: "items", value: JsonValue::Array([
+            JsonValue::Null, JsonValue::Bool(false), JsonValue::Number("9007199254740993"), JsonValue::Number("-0.25E+02")
+        ]))
+    ]));
+}
+example "parse empty containers and all single-character escapes" {
+    input text: "[[],{},\"\\\"\\\\\\/\\b\\f\\n\\r\\t\"]";
+    expect Ok(JsonValue::Array([JsonValue::Array([]), JsonValue::Object([]),
+                               JsonValue::String("\"\\/\b\f\n\r\t")]));
+}
+example "decode Unicode escapes and supplementary code points" {
+    input text: "\"\\u0061\\u00df\\uD834\\uDD1E\"";
+    expect Ok(JsonValue::String("aß𝄞"));
+}
+example "reject duplicate decoded keys at the opening quote" {
+    input text: "{\"a\":1,\"\\u0061\":2}";
+    expect Err(JsonError(kind: JsonErrorKind::DuplicateKey, offset: 7));
+}
+example "offsets count code points even after supplementary characters" {
+    input text: "[\"𝄞\",]";
+    expect Err(JsonError(kind: JsonErrorKind::ExpectedValue, offset: 5));
+}
+example "reject unpaired surrogates" {
+    input text: "\"\\uDEAD\"";
+    expect Err(JsonError(kind: JsonErrorKind::InvalidUnicode, offset: 2));
+}
+example "reject malformed Unicode escapes" {
+    input text: "\"\\u000g\"";
+    expect Err(JsonError(kind: JsonErrorKind::InvalidEscape, offset: 6));
+}
+example "reject literal control characters" {
+    input text: "\"\n\"";
+    expect Err(JsonError(kind: JsonErrorKind::InvalidString, offset: 1));
+}
+example "reject leading zeros" {
+    input text: "01";
+    expect Err(JsonError(kind: JsonErrorKind::InvalidNumber, offset: 1));
+}
+example "reject incomplete exponents" {
+    input text: "1e+";
+    expect Err(JsonError(kind: JsonErrorKind::InvalidNumber, offset: 3));
+}
+example "reject a second value" {
+    input text: "true false";
+    expect Err(JsonError(kind: JsonErrorKind::TrailingContent, offset: 5));
+}
+example "reject a leading byte order mark" {
+    input text: "\ufeffnull";
+    expect Err(JsonError(kind: JsonErrorKind::ExpectedValue, offset: 0));
+}
+example "reject comments" {
+    input text: "/* note */ null";
+    expect Err(JsonError(kind: JsonErrorKind::ExpectedValue, offset: 0));
+}
+example "reject trailing commas in objects" {
+    input text: "{\"x\":1,}";
+    expect Err(JsonError(kind: JsonErrorKind::ExpectedKey, offset: 7));
+}
+example "reject incomplete containers at the end of input" {
+    input text: "[0";
+    expect Err(JsonError(kind: JsonErrorKind::UnexpectedEnd, offset: 2));
+}
+example "reject the 129th nested container" {
+    input text: "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[";
+    expect Err(JsonError(kind: JsonErrorKind::DepthLimitExceeded, offset: 128));
+}
+export pure deterministic ending fn parse(text: string) -> result<JsonValue, JsonError> {
+    let points = codePoints(text);
+    if peek(points, maxOffset()) != endOfText() {
+        return Err(JsonError(kind: JsonErrorKind::InputTooLong, offset: maxOffset()));
+    }
+    let mut state = ParseState(stack: Stack::Root, phase: Phase::Value, depth: 0, offset: 0);
+    // Each successful step consumes at least one code point, including whitespace.
+    for budget in points {
+        let point = peek(points, state.offset);
+        if point == endOfText() { return finishParse(state); }
+        match parseStep(points, state, point) {
+            Ok(next) { state = next; }
+            Err(error) { return Err(error); }
+        }
+    }
+    return finishParse(state);
+}
+
+pure ending fn findMember(members: list<JsonMember>, key: string) -> result<JsonValue, JsonAccessErrorKind> {
+    let mut found = false;
+    let mut value = JsonValue::Null;
+    for member in members {
+        if member.key == key {
+            if found { return Err(JsonAccessErrorKind::AmbiguousKey); }
+            found = true;
+            value = member.value;
+        }
+    }
+    if found { return Ok(value); }
+    return Err(JsonAccessErrorKind::MissingKey);
+}
+
+pure ending fn findElement(items: list<JsonValue>, index: uint32) -> result<JsonValue, JsonAccessErrorKind> {
+    let mut position: uint32 = 0;
+    for item in items {
+        if position == index { return Ok(item); }
+        position = nextIndex(position);
+    }
+    return Err(JsonAccessErrorKind::IndexOutOfBounds);
+}
+
+pure ending fn accessSegment(value: JsonValue, segment: JsonPathSegment) -> result<JsonValue, JsonAccessErrorKind> {
+    match value {
+        Null { return Err(JsonAccessErrorKind::WrongValueKind); }
+        Bool(flag) { return Err(JsonAccessErrorKind::WrongValueKind); }
+        String(text) { return Err(JsonAccessErrorKind::WrongValueKind); }
+        Number(spelling) { return Err(JsonAccessErrorKind::WrongValueKind); }
+        Object(members) {
+            match segment {
+                Key(key) { return findMember(members, key); }
+                Index(index) { return Err(JsonAccessErrorKind::WrongValueKind); }
+            }
+        }
+        Array(items) {
+            match segment {
+                Key(key) { return Err(JsonAccessErrorKind::WrongValueKind); }
+                Index(index) { return findElement(items, index); }
+            }
+        }
+    }
+}
+
+example "an empty path selects the root" {
+    input value: JsonValue::Bool(true);
+    input path: [];
+    expect Ok(JsonValue::Bool(true));
+}
+example "select a nested value by an array index and a numeric object key" {
+    input value: JsonValue::Array([JsonValue::Object([
+        JsonMember(key: "0", value: JsonValue::String("found"))
+    ])]);
+    input path: [JsonPathSegment::Index(0), JsonPathSegment::Key("0")];
+    expect Ok(JsonValue::String("found"));
+}
+example "an existing null is a successful lookup" {
+    input value: JsonValue::Object([JsonMember(key: "", value: JsonValue::Null)]);
+    input path: [JsonPathSegment::Key("")];
+    expect Ok(JsonValue::Null);
+}
+example "report the position of a missing key" {
+    input value: JsonValue::Array([JsonValue::Object([])]);
+    input path: [JsonPathSegment::Index(0), JsonPathSegment::Key("missing")];
+    expect Err(JsonAccessError(kind: JsonAccessErrorKind::MissingKey, segment: 1));
+}
+example "handle the full range of unsigned array indices" {
+    input value: JsonValue::Array([JsonValue::Null]);
+    input path: [JsonPathSegment::Index(4294967295)];
+    expect Err(JsonAccessError(kind: JsonAccessErrorKind::IndexOutOfBounds, segment: 0));
+}
+example "an index requires an array" {
+    input value: JsonValue::Object([JsonMember(key: "0", value: JsonValue::Null)]);
+    input path: [JsonPathSegment::Index(0)];
+    expect Err(JsonAccessError(kind: JsonAccessErrorKind::WrongValueKind, segment: 0));
+}
+example "reject an ambiguous key in a manually constructed object" {
+    input value: JsonValue::Object([
+        JsonMember(key: "a", value: JsonValue::Null),
+        JsonMember(key: "a", value: JsonValue::Bool(true))
+    ]);
+    input path: [JsonPathSegment::Key("a")];
+    expect Err(JsonAccessError(kind: JsonAccessErrorKind::AmbiguousKey, segment: 0));
+}
+export pure deterministic ending fn access(value: JsonValue, path: list<JsonPathSegment>)
+        -> result<JsonValue, JsonAccessError> {
+    let mut current = value;
+    let mut position: uint32 = 0;
+    for segment in path {
+        match accessSegment(current, segment) {
+            Ok(next) { current = next; }
+            Err(kind) { return Err(JsonAccessError(kind: kind, segment: position)); }
+        }
+        position = nextIndex(position);
+    }
+    return Ok(current);
+}
+
+pure ending fn escapeControl(point: uint32) -> result<string, UnicodeError> {
+    let digits = codePoints("0123456789abcdef");
+    let mut value: uint32 = 0;
+    let mut prefix = "\\u000";
+    if point >= 16 {
+        value = 16;
+        prefix = "\\u001";
+    }
+    for digit in digits {
+        if point == value {
+            match stringFromCodePoints([digit]) {
+                Ok(text) { return Ok(concat(left: prefix, right: text)); }
+                Err(error) { return Err(error); }
+            }
+        }
+        value = nextIndex(value);
+    }
+    return Err(UnicodeError(index: 0));
+}
+
+pure ending fn escapePoint(point: uint32) -> result<string, UnicodeError> {
+    if point == 34 { return Ok("\\\""); }
+    if point == 92 { return Ok("\\\\"); }
+    if point == 8 { return Ok("\\b"); }
+    if point == 12 { return Ok("\\f"); }
+    if point == 10 { return Ok("\\n"); }
+    if point == 13 { return Ok("\\r"); }
+    if point == 9 { return Ok("\\t"); }
+    if point < 32 { return escapeControl(point); }
+    return stringFromCodePoints([point]);
+}
+
+pure ending fn needsEscaping(points: list<uint32>) -> bool {
+    for point in points {
+        if point < 32 { return true; }
+        if point == 34 { return true; }
+        if point == 92 { return true; }
+        if isSurrogate(point) { return true; }
+    }
+    return false;
+}
+
+pure ending fn quoteText(text: string) -> result<string, UnicodeError> {
+    let points = codePoints(text);
+    if needsEscaping(points) == false {
+        return Ok(concat(left: "\"", right: concat(left: text, right: "\"")));
+    }
+    let mut quoted = "\"";
+    for point in points {
+        match escapePoint(point) {
+            Ok(piece) { quoted = concat(left: quoted, right: piece); }
+            Err(error) { return Err(error); }
+        }
+    }
+    return Ok(concat(left: quoted, right: "\""));
+}
+
+record PendingValue { value: JsonValue, reversedPath: list<JsonPathSegment> }
+enum Piece { Text(string), Pending(PendingValue) }
+
+pure ending fn serializeError(kind: JsonSerializeErrorKind, reversedPath: list<JsonPathSegment>) -> JsonSerializeError {
+    let mut path: list<JsonPathSegment> = [];
+    for segment in reversedPath { path = prepend(segment, path); }
+    return JsonSerializeError(kind: kind, path: path);
+}
+
+pure ending fn renderNumber(spelling: string, pending: PendingValue, reversed: list<Piece>)
+        -> result<list<Piece>, JsonSerializeError> {
+    let points = codePoints(spelling);
+    if peek(points, maxOffset()) == endOfText() {
+        match scanNumber(points, 0) {
+            Ok(number) {
+                if peek(points, number.next) == endOfText() {
+                    return Ok(prepend(Piece::Text(spelling), reversed));
+                }
+            }
+            Err(error) {}
+        }
+    }
+    return Err(serializeError(JsonSerializeErrorKind::InvalidNumber, pending.reversedPath));
+}
+
+pure ending fn renderArray(items: list<JsonValue>, pending: PendingValue, reversed: list<Piece>)
+        -> list<Piece> {
+    let mut output = prepend(Piece::Text("["), reversed);
+    let mut index: uint32 = 0;
+    for item in items {
+        if index != 0 { output = prepend(Piece::Text(","), output); }
+        let path = prepend(JsonPathSegment::Index(index), pending.reversedPath);
+        output = prepend(Piece::Pending(PendingValue(value: item, reversedPath: path)), output);
+        index = nextIndex(index);
+    }
+    return prepend(Piece::Text("]"), output);
+}
+
+pure ending fn renderObject(members: list<JsonMember>, pending: PendingValue, reversed: list<Piece>)
+        -> result<list<Piece>, JsonSerializeError> {
+    let mut output = prepend(Piece::Text("{"), reversed);
+    let mut seen: list<JsonMember> = [];
+    let mut first = true;
+    for member in members {
+        let path = prepend(JsonPathSegment::Key(member.key), pending.reversedPath);
+        if memberKeyExists(seen, member.key) {
+            return Err(serializeError(JsonSerializeErrorKind::DuplicateKey, path));
+        }
+        match quoteText(member.key) {
+            Err(error) { return Err(serializeError(JsonSerializeErrorKind::InvalidUnicode, path)); }
+            Ok(key) {
+                if first == false { output = prepend(Piece::Text(","), output); }
+                output = prepend(Piece::Text(concat(left: key, right: ":")), output);
+                output = prepend(Piece::Pending(PendingValue(value: member.value, reversedPath: path)), output);
+            }
+        }
+        seen = prepend(member, seen);
+        first = false;
+    }
+    return Ok(prepend(Piece::Text("}"), output));
+}
+
+pure ending fn renderValue(pending: PendingValue, reversed: list<Piece>, depth: uint32)
+        -> result<list<Piece>, JsonSerializeError> {
+    match pending.value {
+        Null { return Ok(prepend(Piece::Text("null"), reversed)); }
+        Bool(flag) {
+            if flag { return Ok(prepend(Piece::Text("true"), reversed)); }
+            return Ok(prepend(Piece::Text("false"), reversed));
+        }
+        String(text) {
+            match quoteText(text) {
+                Ok(quoted) { return Ok(prepend(Piece::Text(quoted), reversed)); }
+                Err(error) { return Err(serializeError(JsonSerializeErrorKind::InvalidUnicode, pending.reversedPath)); }
+            }
+        }
+        Number(spelling) { return renderNumber(spelling, pending, reversed); }
+        Array(items) {
+            if depth == depthLimit() {
+                return Err(serializeError(JsonSerializeErrorKind::DepthLimitExceeded, pending.reversedPath));
+            }
+            return Ok(renderArray(items, pending, reversed));
+        }
+        Object(members) {
+            if depth == depthLimit() {
+                return Err(serializeError(JsonSerializeErrorKind::DepthLimitExceeded, pending.reversedPath));
+            }
+            return renderObject(members, pending, reversed);
+        }
+    }
+}
+
+enum RenderedLevel { Complete(string), More(list<Piece>) }
+
+pure ending fn renderLevel(pieces: list<Piece>, depth: uint32) -> result<RenderedLevel, JsonSerializeError> {
+    let mut reversed: list<Piece> = [];
+    let mut text = "";
+    let mut hadPending = false;
+    for piece in pieces {
+        match piece {
+            Text(fragment) { text = concat(left: text, right: fragment); }
+            Pending(pending) {
+                hadPending = true;
+                if text != "" { reversed = prepend(Piece::Text(text), reversed); }
+                text = "";
+                match renderValue(pending, reversed, depth) {
+                    Ok(output) { reversed = output; }
+                    Err(error) { return Err(error); }
+                }
+            }
+        }
+    }
+    if hadPending == false { return Ok(RenderedLevel::Complete(text)); }
+    if text != "" { reversed = prepend(Piece::Text(text), reversed); }
+    let mut ordered: list<Piece> = [];
+    for piece in reversed { ordered = prepend(piece, ordered); }
+    return Ok(RenderedLevel::More(ordered));
+}
+
+// Build a finite sequence for the checker: one pass at each depth plus a final text-only pass.
+pure ending fn renderPasses() -> list<bool> {
+    let mut passes: list<bool> = [true, true];
+    let mut depth: uint32 = 0;
+    let block = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+    for row in block {
+        for column in block {
+            if depth == depthLimit() { return passes; }
+            passes = prepend(true, passes);
+            depth = nextIndex(depth);
+        }
+    }
+    return passes;
+}
+
+example "serialize compact JSON with exact number spellings and field order" {
+    input value: JsonValue::Object([
+        JsonMember(key: "z", value: JsonValue::Number("1e400")),
+        JsonMember(key: "a", value: JsonValue::Array([JsonValue::Null, JsonValue::Bool(false), JsonValue::Object([])]))
+    ]);
+    expect Ok("{\"z\":1e400,\"a\":[null,false,{}]}");
+}
+example "escape keys, quotes, backslashes and control characters" {
+    input value: JsonValue::Object([
+        JsonMember(key: "\"\\", value: JsonValue::String("𝄞/\u0000\u001f\b\f\n\r\t"))
+    ]);
+    expect Ok("{\"\\\"\\\\\":\"𝄞/\\u0000\\u001f\\b\\f\\n\\r\\t\"}");
+}
+example "reject invalid number text at its nested path" {
+    input value: JsonValue::Object([
+        JsonMember(key: "a", value: JsonValue::Array([JsonValue::Number("01")]))
+    ]);
+    expect Err(JsonSerializeError(kind: JsonSerializeErrorKind::InvalidNumber,
+                                  path: [JsonPathSegment::Key("a"), JsonPathSegment::Index(0)]));
+}
+example "a manually constructed number cannot contain trailing whitespace" {
+    input value: JsonValue::Number("1 ");
+    expect Err(JsonSerializeError(kind: JsonSerializeErrorKind::InvalidNumber, path: []));
+}
+example "reject duplicate manually constructed keys" {
+    input value: JsonValue::Object([
+        JsonMember(key: "a", value: JsonValue::Null),
+        JsonMember(key: "a", value: JsonValue::Bool(true))
+    ]);
+    expect Err(JsonSerializeError(kind: JsonSerializeErrorKind::DuplicateKey, path: [JsonPathSegment::Key("a")]));
+}
+export pure deterministic ending fn serialize(value: JsonValue) -> result<string, JsonSerializeError> {
+    let passes = renderPasses();
+    let root = PendingValue(value: value, reversedPath: []);
+    let mut pieces = [Piece::Pending(root)];
+    let mut depth: uint32 = 0;
+    for pass in passes {
+        match renderLevel(pieces, depth) {
+            Err(error) { return Err(error); }
+            Ok(level) {
+                match level {
+                    Complete(text) { return Ok(text); }
+                    More(next) { pieces = next; }
+                }
+            }
+        }
+        depth = nextIndex(depth);
+    }
+    return Err(JsonSerializeError(kind: JsonSerializeErrorKind::DepthLimitExceeded, path: []));
+}

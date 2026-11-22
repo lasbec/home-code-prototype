@@ -135,6 +135,8 @@ Mark public functions, records, and enums with `export`. Place function examples
 
 `check`, `run`, and `test` check all reachable files. `run` invokes `main` from the selected file. `test` executes examples attached to functions in that file, and `test -r` includes examples from every reachable file once.
 
+The JSON module in `examples/lib/json.proto` exports `parse`, `serialize`, and `access`. Import it with a relative path to `json.proto`. Numbers retain their original spelling, and objects retain field order. The codec rejects duplicate keys and limits nesting to 128 arrays or objects. Run its examples with `python3 -B -m prototype test examples/lib/json.proto`.
+
 ## Save and export a program
 
 ```sh
@@ -190,5 +192,6 @@ Values can use numbers, strings, booleans, `unit`, lists, named record fields, e
 - **Data and errors.** Use `bool`, `string`, `unit`, homogeneous `list<T>`, and `result<T, E>`. Records have named fields and enums have named cases with an optional typed payload. A `match` requires an arm for each result or enum case. Error values can flow through function calls and returns. The language omits null and exceptions.
 - **Iteration and collections.** Use `loop { ... }` for repeated work that exits via `return`. The checker forbids this construct in an `ending` function. Lists are immutable. `prepend(item, items)` and `dropLast(items)` return new lists. `dropLast([])` returns an empty list. `at(items, index)` uses zero-based indexing and returns `result<T, IndexError>`.
 - **Text and host errors.** Use `concat(left: ..., right: ...)` to join strings, `splitLines` to split on LF or CRLF, and `formatInt32` and `parseInt32` to convert between strings and integers. Parsing returns a `result<int32, ParseIntError>`. `hostErrorKind` distinguishes `EndOfInput`, `FileNotFound`, and `Other`, and `describeHostError` formats the diagnostic.
+- **Unicode.** `codePoints(text)` returns a `list<uint32>` in text order. `stringFromCodePoints(points)` constructs a string from Unicode scalar values and returns a `result<string, UnicodeError>`. The error's `index` field identifies the first invalid code point, starting at zero.
 
 See the [glossary](GLOSSARY.md) and [decision records](docs/adr/) for the terms and design choices from the interview.

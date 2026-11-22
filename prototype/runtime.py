@@ -255,6 +255,15 @@ def split_lines(text):
     return tuple(text.replace("\r\n", "\n").removesuffix("\n").split("\n"))
 
 
+def string_from_code_points(points):
+    characters = []
+    for index, point in enumerate(points):
+        if point > 0x10FFFF or 0xD800 <= point <= 0xDFFF:
+            return Result("Err", Record("UnicodeError", (("index", index),)))
+        characters.append(chr(point))
+    return Result("Ok", "".join(characters))
+
+
 def parse_int(text):
     digits = text.removeprefix("-")
     if not (digits.isascii() and digits.isdecimal()):
@@ -299,6 +308,8 @@ BUILTINS = {
     "dropLast": lambda items: items[:-1],
     "concat": lambda left, right: left + right,
     "splitLines": split_lines,
+    "codePoints": lambda text: tuple(map(ord, text)),
+    "stringFromCodePoints": string_from_code_points,
     "parseInt32": parse_int,
     "formatInt32": str,
     "hostErrorKind": host_error_kind,

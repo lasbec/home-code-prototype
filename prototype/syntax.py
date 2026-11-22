@@ -98,6 +98,7 @@ INDEX_ERROR = Type("IndexError")
 HOST_ERROR = Type("HostError")
 HOST_ERROR_KIND = Type("HostErrorKind")
 PARSE_INT_ERROR = Type("ParseIntError")
+UNICODE_ERROR = Type("UnicodeError")
 EXAMPLE_ERROR_MESSAGES = {
     KILLED.name: False, OVERFLOW.name: False, ZERO.name: False, INDEX_ERROR.name: True, PARSE_INT_ERROR.name: True,
 }
@@ -108,7 +109,8 @@ SIMPLE_TYPES = (
         name for name, operation in CHANNEL_ERRORS.items() if not operation.carries_message
     } | {
         item.name for item in (BOOL, STRING, UNIT, RANDOM_DRAW, KILLED,
-                               OVERFLOW, ZERO, INDEX_ERROR, HOST_ERROR, HOST_ERROR_KIND, PARSE_INT_ERROR)
+                               OVERFLOW, ZERO, INDEX_ERROR, HOST_ERROR, HOST_ERROR_KIND, PARSE_INT_ERROR,
+                               UNICODE_ERROR)
     }
 )
 

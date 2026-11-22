@@ -7,7 +7,7 @@ from .channels import signatures as channels
 from .syntax import (
     BOOL, CAPABILITIES, CONSOLE, EXAMPLE_ERROR_MESSAGES, FILESYSTEM, FLOAT, GENERIC_TYPES, GUARANTEES, HOST_ERROR,
     HOST_ERROR_KIND, INDEX_ERROR, INT, INTEGER_BOUNDS, OVERFLOW, PARSE_INT_ERROR, RANDOM, RANDOM_DRAW, SIMPLE_TYPES,
-    STRING, THREADS, UINT, UNIT, ZERO, Argument, EnumDeclaration, Function, LanguageError, Node, Parameter,
+    STRING, THREADS, UINT, UNICODE_ERROR, UNIT, ZERO, Argument, EnumDeclaration, Function, LanguageError, Node, Parameter,
     RecordDeclaration, Token, Type, builtin, product_units, quotient_units, result_type,
 )
 
@@ -35,10 +35,17 @@ HOST_FUNCTIONS = {
 }
 HOST_ERROR_CONSTRUCTOR = builtin("HostError", (("kind", HOST_ERROR_KIND), ("message", STRING)),
                                  HOST_ERROR, GUARANTEES)
+BUILTIN_RECORDS = {
+    RANDOM_DRAW: builtin(RANDOM_DRAW.name, (("value", INT), ("state", INT)), RANDOM_DRAW, GUARANTEES),
+    UNICODE_ERROR: builtin(UNICODE_ERROR.name, (("index", UINT),), UNICODE_ERROR, GUARANTEES),
+}
+CODE_POINTS = Type("list", (UINT,))
 PURE_FUNCTIONS = {
     function.name: function for function in (
         builtin("concat", (("left", STRING), ("right", STRING)), STRING, GUARANTEES),
         builtin("splitLines", (("text", STRING),), Type("list", (STRING,)), GUARANTEES),
+        builtin("codePoints", (("text", STRING),), CODE_POINTS, GUARANTEES),
+        builtin("stringFromCodePoints", (("points", CODE_POINTS),), result_type(STRING, UNICODE_ERROR), GUARANTEES),
         builtin("parseInt32", (("text", STRING),), result_type(INT, PARSE_INT_ERROR), GUARANTEES),
         builtin("formatInt32", (("value", INT),), STRING, GUARANTEES),
         builtin("hostErrorKind", (("error", HOST_ERROR),), HOST_ERROR_KIND, GUARANTEES),
@@ -185,10 +192,9 @@ class Checker:
         }
         self.functions = {}
         self.imported_functions = {}
-        self.record_names = {RANDOM_DRAW.name: RANDOM_DRAW}
+        self.record_names = {value_type.name: value_type for value_type in BUILTIN_RECORDS}
         self.enum_names = {kind.name: kind for kind in (HOST_ERROR_KIND, *channels.ENUMS)}
-        self.records = {RANDOM_DRAW: builtin(RANDOM_DRAW.name, (("value", INT), ("state", INT)),
-                                             RANDOM_DRAW, GUARANTEES)}
+        self.records = BUILTIN_RECORDS.copy()
         self.enums = {
             HOST_ERROR_KIND: {"EndOfInput": None, "FileNotFound": None, "Other": None},
             **channels.ENUMS,
@@ -213,7 +219,7 @@ class Checker:
                 if function.exported
             })
         self.current_function = None
-        used_names = (BUILTIN_NAMES - self.mock_operations.keys()) | {RANDOM_DRAW.name}
+        used_names = (BUILTIN_NAMES - self.mock_operations.keys()) | self.record_names.keys()
         builtin_types = SIMPLE_TYPES | INTEGER_BOUNDS.keys() | GENERIC_TYPES.keys() | {"Uint32", "f64"}
         for declaration in declarations:
             token = declaration.token
